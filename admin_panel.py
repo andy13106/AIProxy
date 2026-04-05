@@ -29,7 +29,7 @@ st.markdown("""
 
 # --- 侧边栏 ---
 st.sidebar.title("🤖 AI-Proxy Admin")
-if st.sidebar.button("🔄 刷新页面", use_container_width=True):
+if st.sidebar.button("🔄 刷新页面", width="stretch"):
     st.rerun()
 
 menu = st.sidebar.radio("导航", ["使用概览", "供应商管理", "API Key 管理", "模型映射管理", "工具配置助手", "系统设置"])
@@ -178,7 +178,7 @@ if menu == "使用概览":
             "Total Tokens": row.total_tokens or 0,
             "图片数": row.images_count or 0,
         } for row in today_summary])
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
 
         st.caption("点击下方模型按钮可查看该模型明细；默认上方仅统计当天消耗。")
         model_cols = st.columns(min(len(today_summary), 4) or 1)
@@ -207,7 +207,7 @@ if menu == "使用概览":
         d1, d2 = st.columns(2)
         start_date = d1.date_input("开始日期", value=today)
         end_date = d2.date_input("结束日期", value=today)
-        query_submitted = st.form_submit_button("查询明细", use_container_width=True)
+        query_submitted = st.form_submit_button("查询明细", width="stretch")
 
     if query_submitted and all_models:
         st.session_state.usage_selected_model = selected_model
@@ -271,14 +271,14 @@ if menu == "使用概览":
                 "图片": log.images_count,
                 "时间": log.timestamp.strftime("%Y-%m-%d %H:%M:%S")
             } for log in detail_logs])
-            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+            st.dataframe(detail_df, width="stretch", hide_index=True)
 
             p1, p2, p3 = st.columns([1, 2, 1])
-            if p1.button("上一页", disabled=st.session_state.usage_page <= 1, use_container_width=True):
+            if p1.button("上一页", disabled=st.session_state.usage_page <= 1, width="stretch"):
                 st.session_state.usage_page -= 1
                 st.rerun()
             p2.markdown(f"<div style='text-align:center;padding-top:8px;'>第 {st.session_state.usage_page} / {total_pages} 页</div>", unsafe_allow_html=True)
-            if p3.button("下一页", disabled=st.session_state.usage_page >= total_pages, use_container_width=True):
+            if p3.button("下一页", disabled=st.session_state.usage_page >= total_pages, width="stretch"):
                 st.session_state.usage_page += 1
                 st.rerun()
         else:
@@ -294,7 +294,7 @@ elif menu == "供应商管理":
         with st.form("add_p", clear_on_submit=True):
             name = st.text_input("供应商名称").strip()
             base_url = st.text_input("API Base URL", value="https://integrate.api.nvidia.com/v1").strip()
-            if st.form_submit_button("保存供应商", use_container_width=True):
+            if st.form_submit_button("保存供应商", width="stretch"):
                 base_url = base_url.strip().strip("`").strip("'").strip("\"")
                 if not name or not base_url:
                     st.error("请完整填写信息")
@@ -348,7 +348,7 @@ elif menu == "API Key 管理":
                 p_map = {p.name: p.id for p in providers}
                 target_p = st.selectbox("选择供应商", options=list(p_map.keys()))
                 key_val = st.text_input("API Key", type="password").strip()
-                if st.form_submit_button("保存 Key", use_container_width=True):
+                if st.form_submit_button("保存 Key", width="stretch"):
                     key_val = key_val.strip().strip("`").strip("'").strip("\"")
                     if not key_val:
                         st.error("Key 不能为空")
@@ -454,7 +454,7 @@ elif menu == "模型映射管理":
                     st.caption("⚠️ 该供应商下无 Key，请手动输入真实模型名")
                     real_model = st.text_input("真实模型名称").strip()
                 
-                if st.form_submit_button("保存映射", use_container_width=True):
+                if st.form_submit_button("保存映射", width="stretch"):
                     if not v_name or not real_model:
                         st.error("请完整填写映射信息")
                     else:
@@ -633,22 +633,75 @@ elif menu == "工具配置助手":
         st.caption("说明：OpenCode 这里应使用 OpenAI 兼容入口，所以 Base URL 需要带 `/v1`。")
 
     with t3:
-        st.subheader("Cursor / Trae 配置指南")
+        st.subheader("Cursor 配置指南")
         st.markdown(f"""
-        对于 Cursor 或 Trae，请在软件设置中按照以下步骤操作：
-        
-        1.  **打开设置**: `Settings` -> `Models`
-        2.  **禁用原厂模型**: 关闭 `OpenAI` 原厂开关。
-        3.  **配置自定义地址**:
-            - **Base URL**: `{proxy_url_v1}`
-            - **API Key（本地代理访问 Key）**: `{master_key}`
-        4.  **添加模型**:
-            在模型列表中添加以下模型名（您已配置的虚拟模型）：
+        Cursor 对接本代理时，建议按 **OpenAI 兼容接口** 的方式配置。
+        下面按“你在 Cursor 里实际会看到的步骤”来写。
+
+        **建议先理解两个 Key 的区别**：
+        - 这里填入软件设置页面的 **API Key**，应该是你的**本地代理访问 Key**：`{master_key}`
+        - 上游平台的真实 Key（例如 Nvidia / OpenAI / Google）不要填到 Cursor / Trae 里，而是保存在本代理后台的「API Key 管理」中
+
+        **一、打开 Cursor 设置页**
+        - 打开 Cursor
+        - 进入 `Settings`
+        - 找到 `Models`
+        - 如果你看到 `OpenAI`, `OpenAI Compatible`, `Custom OpenAI API`, `Manage Models` 或类似入口，都可以进入
+
+        **二、优先使用自定义 OpenAI 入口**
+        - 如果 Cursor 同时提供“官方 OpenAI”和“自定义 OpenAI API”，请优先选择自定义入口
+        - 如果有原厂 OpenAI 开关，建议先关闭，避免请求直连官方而不是走你的本地代理
+
+        **二、填写代理地址**
+        - `Base URL` / `API Base URL` / `Endpoint`：填写 `{proxy_url_v1}`
+        - 注意这里**必须带 `/v1`**
+        - 不要填写成 `http://localhost:8000`
+
+        **三、填写认证信息**
+        - `API Key`：填写 `{master_key}`
+        - 不要填写上游厂商 Key，例如 `nvapi-...`
+
+        **四、添加模型名称**
+        - 在模型列表里手动新增你在本代理中配置过的“虚拟模型名”
+        - 工具里看到的模型名，必须和代理后台「模型映射管理」中的虚拟模型名完全一致
+        - 例如你后台里配置的是 `GLM5 -> z-ai/glm5`，那 Cursor 里就应该添加 `GLM5`
+        - 不要添加 `z-ai/glm5`
+
+        **五、推荐你在 Cursor 里这样填**
+        - Provider 类型：`OpenAI Compatible` / `Custom OpenAI`
+        - Base URL：`{proxy_url_v1}`
+        - API Key：`{master_key}`
+        - Model Name：`{model_hint}`
+
+        **六、保存后如何验证是否生效**
+        - 在 Cursor 中选择你刚添加的模型，例如 `GLM5`
+        - 发起一次对话
+        - 如果代理后端日志里出现 `POST /v1/chat/completions` 并返回 `200`，说明已经走到本地代理
+        - 如果日志里完全没有请求，说明 Cursor 还没有真正走到你的自定义入口
+
+        **七、最常见的错误**
+        - 填成了 `http://localhost:8000`：这通常是给 Claude Code 用的，Cursor / Trae 这里应使用 `{proxy_url_v1}`
+        - 把上游真实 Key 填到了客户端里：应改为 `{master_key}`
+        - 模型名填成了真实模型名，例如 `z-ai/glm5`：应改为你代理中定义的虚拟模型名，例如 `GLM5`
+        - 保存后仍不生效：尝试重启 Cursor / Trae
+        - 如果提示模型不存在：通常是 Cursor 里的模型名和代理后台“虚拟模型名”不一致
+        - 如果提示鉴权失败：通常是你填成了上游厂商 Key，而不是本地代理 Key
+
+        **八、关于 Trae**
+        - Trae 当前大概率不支持手动填写自定义 `Base URL`
+        - 所以现阶段建议优先使用 Cursor 或 OpenCode 来接这个本地代理
+
+        **当前可直接添加的虚拟模型名**：
         """)
         if v_models:
             st.info(", ".join(v_models))
         else:
             st.warning("您尚未在'模型映射管理'中添加任何虚拟模型！")
+
+        st.code(
+            f"Provider: OpenAI Compatible / Custom OpenAI\nBase URL: {proxy_url_v1}\nAPI Key: {master_key}\n示例模型: {model_hint}",
+            language="text"
+        )
 
     with t4:
         st.subheader("其他工具通用配置")
