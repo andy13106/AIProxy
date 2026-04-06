@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import Session
 from db import SessionLocal, sync_engine, Provider, APIKey, ModelMapping, UsageLog, Base
@@ -7,6 +8,7 @@ import datetime
 import requests
 import os
 import json
+import base64
 
 # --- 数据库初始化 ---
 # 仅在第一次运行时初始化
@@ -33,7 +35,7 @@ st.sidebar.title("🤖 AI-Proxy Admin")
 if st.sidebar.button("🔄 刷新页面", width="stretch"):
     st.rerun()
 
-menu = st.sidebar.radio("导航", ["使用概览", "供应商管理", "API Key 管理", "模型映射管理", "工具配置助手", "系统设置"])
+menu = st.sidebar.radio("导航", ["使用概览", "供应商管理", "API Key 管理", "模型映射管理", "工具配置助手", "模型体验", "系统设置"])
 
 # --- 通用操作函数 ---
 def delete_item(model_class, item_id, success_msg):
@@ -53,6 +55,59 @@ def delete_item(model_class, item_id, success_msg):
             st.error(f"删除失败: {e}")
             return False
 
+def upsert_env_value(key: str, value: str, env_path: str = ".env") -> None:
+    """更新 .env 中的某个 key（不存在则追加）"""
+    existing_lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            existing_lines = f.read().splitlines()
+
+    updated = []
+    found = False
+    for line in existing_lines:
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            updated.append(line)
+            continue
+        k, _ = line.split("=", 1)
+        if k.strip() == key:
+            updated.append(f"{key}={value}")
+            found = True
+        else:
+            updated.append(line)
+
+    if not found:
+        updated.append(f"{key}={value}")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(updated).rstrip() + "\n")
+
+
+def copy_button(label: str, value: str, key: str):
+    safe_value = json.dumps(value)
+    safe_label = json.dumps(label)
+    html = f"""
+    <button id="{key}" style="padding:0.35rem 0.7rem;border:1px solid #bbb;border-radius:6px;cursor:pointer;">
+      {label}
+    </button>
+    <script>
+      const btn = document.getElementById({json.dumps(key)});
+      if (btn) {{
+        btn.onclick = async () => {{
+          try {{
+            await navigator.clipboard.writeText({safe_value});
+            btn.innerText = "已复制";
+            setTimeout(() => btn.innerText = {safe_label}, 1200);
+          }} catch (e) {{
+            btn.innerText = "复制失败";
+            setTimeout(() => btn.innerText = {safe_label}, 1200);
+          }}
+        }};
+      }}
+    </script>
+    """
+    components.html(html, height=40)
+
+
 def fetch_models(api_base, api_key):
     try:
         url = api_base.rstrip("/")
@@ -63,7 +118,15 @@ def fetch_models(api_base, api_key):
         if response.status_code == 200:
             data = response.json()
             if isinstance(data, dict) and "data" in data:
-                return [m["id"] for m in data["data"]]
+                models = []
+                for m in data["data"]:
+                    if isinstance(m, dict):
+                        model_id = m.get("id") or m.get("model") or m.get("name")
+                        if model_id:
+                            models.append(model_id)
+                    elif isinstance(m, str):
+                        models.append(m)
+                return models
             elif isinstance(data, list):
                 return [m.get("id", m) for m in data]
         return []
@@ -126,6 +189,62 @@ def test_upstream_chat(api_base, api_key, model_name):
     except Exception as e:
         return False, f"对话请求异常：{str(e)}"
 
+
+def classify_model_type(model_name: str) -> str:
+    """粗略区分模型类型：image / text"""
+    lower = (model_name or "").lower()
+    image_keywords = [
+        "stable-diffusion",
+        "stable_diffusion",
+        "stable diffusion",
+        "sd3",
+        "sd-3",
+        "sd 3",
+        "sd3.5",
+        "sd-3.5",
+        "sd 3.5",
+        "sdxl",
+        "diffusion",
+        "flux",
+        "imagen",
+        "dall-e",
+        "image",
+        "stabilityai/",
+        "black-forest-labs/",
+        "playgroundai/",
+    ]
+    if any(k in lower for k in image_keywords):
+        return "image"
+    if "stable" in lower and "diffusion" in lower:
+        return "image"
+    return "text"
+
+
+def log_custom_usage(
+    key_id: int,
+    model_name: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    images_count: int = 0,
+):
+    """把模型体验页调用写入 usage 统计"""
+    with SessionLocal() as session:
+        log = UsageLog(
+            key_id=key_id,
+            model_name=model_name,
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=completion_tokens or 0,
+            total_tokens=total_tokens or ((prompt_tokens or 0) + (completion_tokens or 0)),
+            images_count=images_count or 0,
+        )
+        session.add(log)
+        session.query(APIKey).filter(APIKey.id == key_id).update(
+            {"usage_count": APIKey.usage_count + 1},
+            synchronize_session=False,
+        )
+        session.commit()
+
 # --- 页面逻辑 ---
 
 if menu == "使用概览":
@@ -180,12 +299,20 @@ if menu == "使用概览":
             "图片数": row.images_count or 0,
         } for row in today_summary])
         st.dataframe(summary_df, width="stretch", hide_index=True)
-
-        st.caption("点击下方模型按钮可查看该模型明细；默认上方仅统计当天消耗。")
-        model_cols = st.columns(min(len(today_summary), 4) or 1)
-        for idx, row in enumerate(today_summary):
-            if model_cols[idx % len(model_cols)].button(f"查看 {row.model_name}", key=f"usage_model_{row.model_name}"):
+        st.caption("可按模型清理统计数据（仅删除 usage_logs，不影响模型映射）。")
+        for row in today_summary:
+            c_view, c_del = st.columns([3, 1])
+            if c_view.button(f"查看 {row.model_name}", key=f"usage_model_{row.model_name}"):
                 st.session_state.usage_selected_model = row.model_name
+            if c_del.button(f"删除 {row.model_name}", key=f"usage_delete_model_{row.model_name}"):
+                with SessionLocal() as session:
+                    deleted = session.query(UsageLog).filter(UsageLog.model_name == row.model_name).delete()
+                    session.commit()
+                if st.session_state.usage_selected_model == row.model_name:
+                    st.session_state.usage_selected_model = None
+                st.toast(f"已删除模型 {row.model_name} 的 {deleted} 条统计记录", icon="🧹")
+                st.rerun()
+
     else:
         st.info("今天还没有有效使用记录。")
 
@@ -431,6 +558,55 @@ elif menu == "模型映射管理":
     if not providers:
         st.warning("请先配置供应商和 API Key")
     else:
+        with st.expander("🖼️ 快速添加图片模型映射（NVIDIA 常见）", expanded=False):
+            st.caption("用于 `/v1/images/generations` 接口。可按需修改虚拟名与真实模型名。")
+            with SessionLocal() as session:
+                all_providers = session.query(Provider).all()
+            provider_name_list = [p.name for p in all_providers]
+            default_provider_idx = provider_name_list.index("Nvidia") if "Nvidia" in provider_name_list else 0
+            target_provider_name = st.selectbox(
+                "选择供应商（图片模型）",
+                options=provider_name_list,
+                index=default_provider_idx if provider_name_list else 0,
+                key="image_model_provider_select",
+            )
+            preset_text = st.text_area(
+                "预设映射（每行: 虚拟名=真实模型名）",
+                value=(
+                    "sd3=stabilityai/stable-diffusion-3-medium\n"
+                    "sd3.5=stabilityai/stable-diffusion-3.5-large"
+                ),
+                height=90,
+            )
+            if st.button("添加图片模型预设", key="add_image_model_presets"):
+                target_provider = next((p for p in all_providers if p.name == target_provider_name), None)
+                if not target_provider:
+                    st.error("未找到目标供应商")
+                else:
+                    lines = [ln.strip() for ln in preset_text.splitlines() if ln.strip() and "=" in ln]
+                    added = 0
+                    skipped = 0
+                    with SessionLocal() as session:
+                        for line in lines:
+                            virtual_name, real_name = [x.strip() for x in line.split("=", 1)]
+                            if not virtual_name or not real_name:
+                                continue
+                            exists = session.query(ModelMapping).filter(ModelMapping.virtual_name == virtual_name).first()
+                            if exists:
+                                skipped += 1
+                                continue
+                            session.add(
+                                ModelMapping(
+                                    virtual_name=virtual_name,
+                                    real_name=real_name,
+                                    provider_id=target_provider.id,
+                                )
+                            )
+                            added += 1
+                        session.commit()
+                    st.success(f"完成：新增 {added} 条，跳过 {skipped} 条（已存在）。")
+                    st.rerun()
+
         # 1. 添加表单
         with st.expander("➕ 添加新映射", expanded=False):
             p_map = {p.name: p for p in providers}
@@ -503,7 +679,7 @@ elif menu == "工具配置助手":
     # 实际应用中这些应当来自环境变量或数据库
     base_host = "http://localhost:8000"
     proxy_url_v1 = f"{base_host}/v1"
-    master_key = "sk-admin-123456"
+    master_key = os.getenv("MASTER_KEY", "sk-admin-123456")
     
     with SessionLocal() as session:
         mappings = session.query(ModelMapping).all()
@@ -521,7 +697,7 @@ elif menu == "工具配置助手":
                 "name": "AIProxy",
                 "options": {
                     "baseURL": proxy_url_v1,
-                    "apiKey": "{env:AIPROXY_KEY}",
+                    "apiKey": master_key,
                 },
                 "models": opencode_models_dict,
             }
@@ -599,7 +775,6 @@ elif menu == "工具配置助手":
             key="opencode_default_model",
         )
         opencode_start_content = (
-            f"$env:AIPROXY_KEY='{master_key}'\n"
             "$env:OPENCODE_CONFIG='opencode.json'\n"
             "Write-Host 'Starting OpenCode with AIProxy...' -ForegroundColor Cyan\n"
             "Write-Host \"Config: $env:OPENCODE_CONFIG\" -ForegroundColor DarkGray\n"
@@ -639,7 +814,7 @@ elif menu == "工具配置助手":
         在 PowerShell 中运行以下命令：
         """)
         st.code(
-            f"$env:AIPROXY_KEY='{master_key}'; $env:OPENCODE_CONFIG='opencode.json'; opencode -m aiproxy/{selected_opencode_model}",
+            f"$env:OPENCODE_CONFIG='opencode.json'; opencode -m aiproxy/{selected_opencode_model}",
             language="powershell"
         )
 
@@ -730,9 +905,225 @@ elif menu == "工具配置助手":
         
         st.button("📋 复制全部配置信息", on_click=lambda: st.write("信息已复制到剪贴板 (模拟行为)"))
 
+elif menu == "模型体验":
+    st.header("🎛️ 模型体验")
+    st.info("直接使用供应商模型列表进行文本对话和图片生成（不依赖映射列表），并计入使用概览统计。")
+
+    with SessionLocal() as session:
+        providers = session.query(Provider).all()
+        active_keys = session.query(APIKey).filter(APIKey.is_active.is_(True)).all()
+
+    if not providers:
+        st.warning("暂无供应商，请先到「供应商管理」添加。")
+    elif not active_keys:
+        st.warning("暂无可用 API Key，请先到「API Key 管理」添加并启用。")
+    else:
+        provider_to_key = {}
+        for p in providers:
+            key = next((k for k in active_keys if k.provider_id == p.id), None)
+            if key:
+                provider_to_key[p.name] = (p, key)
+
+        if not provider_to_key:
+            st.warning("当前供应商都没有可用 Key。")
+        else:
+            provider_names = list(provider_to_key.keys())
+            selected_provider_name = st.selectbox("选择供应商", options=provider_names)
+            selected_provider, selected_key = provider_to_key[selected_provider_name]
+
+            cache_key = f"provider_models_{selected_provider.id}"
+            if cache_key not in st.session_state:
+                st.session_state[cache_key] = []
+
+            c_refresh, c_hint = st.columns([1, 3])
+            if c_refresh.button("刷新供应商模型列表", key=f"refresh_models_{selected_provider.id}"):
+                st.session_state[cache_key] = fetch_models(selected_provider.api_base, selected_key.key)
+            c_hint.caption("模型列表来源：供应商 `/models` 接口。")
+
+            provider_models = st.session_state[cache_key] or fetch_models(selected_provider.api_base, selected_key.key)
+            st.session_state[cache_key] = provider_models
+
+            if not provider_models:
+                st.warning("未获取到模型列表。请检查供应商 Base URL / Key。")
+            else:
+                text_models = [m for m in provider_models if classify_model_type(m) == "text"]
+                image_models = [m for m in provider_models if classify_model_type(m) == "image"]
+                st.caption(f"检测结果：文本模型 {len(text_models)} 个，图片模型 {len(image_models)} 个。")
+                with st.expander("查看供应商返回的原始模型列表（调试）", expanded=False):
+                    st.write(provider_models)
+                force_all_for_image = st.checkbox(
+                    "高级：图片模型下拉显示全部供应商模型（用于识别遗漏）",
+                    value=False,
+                    key=f"force_all_image_models_{selected_provider.id}",
+                )
+                image_model_options = provider_models if force_all_for_image else image_models
+
+                t_chat, t_image = st.tabs(["文本对话", "图片生成"])
+
+                with t_chat:
+                    st.subheader("文本模型对话")
+                    if not text_models:
+                        st.info("当前供应商模型列表中未识别到文本模型。")
+                    else:
+                        chat_model = st.selectbox("选择文本模型", options=text_models, key="playground_chat_model")
+                        chat_max_tokens = st.slider("max_tokens", min_value=32, max_value=4096, value=512, step=32)
+                        chat_temperature = st.slider("temperature", min_value=0.0, max_value=1.5, value=0.7, step=0.1)
+
+                        chat_state_key = f"chat_history_{selected_provider.id}_{chat_model}"
+                        if chat_state_key not in st.session_state:
+                            st.session_state[chat_state_key] = []
+
+                        for msg in st.session_state[chat_state_key]:
+                            with st.chat_message(msg["role"]):
+                                st.markdown(msg["content"])
+
+                        user_input = st.chat_input("输入消息并回车发送", key=f"chat_input_{selected_provider.id}_{chat_model}")
+                        if user_input:
+                            st.session_state[chat_state_key].append({"role": "user", "content": user_input})
+                            with st.chat_message("user"):
+                                st.markdown(user_input)
+
+                            url = f"{selected_provider.api_base.rstrip('/')}/chat/completions"
+                            headers = {
+                                "Authorization": f"Bearer {selected_key.key}",
+                                "Content-Type": "application/json",
+                            }
+                            payload = {
+                                "model": chat_model,
+                                "messages": st.session_state[chat_state_key],
+                                "max_tokens": chat_max_tokens,
+                                "temperature": chat_temperature,
+                                "stream": False,
+                            }
+                            try:
+                                resp = requests.post(url, headers=headers, json=payload, timeout=120)
+                                if resp.status_code == 200:
+                                    data = resp.json()
+                                    assistant_text = (
+                                        (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                                        or "(空响应)"
+                                    )
+                                    st.session_state[chat_state_key].append({"role": "assistant", "content": assistant_text})
+                                    with st.chat_message("assistant"):
+                                        st.markdown(assistant_text)
+
+                                    usage = data.get("usage", {}) if isinstance(data, dict) else {}
+                                    ptk = usage.get("prompt_tokens", 0) or 0
+                                    ctk = usage.get("completion_tokens", 0) or 0
+                                    ttk = usage.get("total_tokens", ptk + ctk) or (ptk + ctk)
+                                    log_custom_usage(
+                                        key_id=selected_key.id,
+                                        model_name=chat_model,
+                                        prompt_tokens=ptk,
+                                        completion_tokens=ctk,
+                                        total_tokens=ttk,
+                                    )
+                                else:
+                                    st.error(f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}")
+                            except Exception as e:
+                                st.error(f"请求异常：{e}")
+
+                        if st.button("清空当前对话", key=f"clear_chat_{selected_provider.id}_{chat_model}"):
+                            st.session_state[chat_state_key] = []
+                            st.rerun()
+
+                with t_image:
+                    st.subheader("文生图模型生成")
+                    manual_image_model = st.text_input(
+                        "手动输入图片模型 ID（可选）",
+                        value="stabilityai/stable-diffusion-3.5-large",
+                        help="当下拉里没有 SD3/SD3.5 时可直接填写模型 ID。",
+                    ).strip()
+                    use_manual_image_model = st.checkbox("优先使用手动模型 ID", value=False)
+
+                    if image_model_options:
+                        selected_image_model = st.selectbox("选择图片模型", options=image_model_options, key="playground_image_model")
+                    else:
+                        selected_image_model = manual_image_model or ""
+                        st.info("当前下拉没有识别到图片模型，可勾选上方手动模型 ID 直接调用。")
+
+                    image_model = manual_image_model if (use_manual_image_model and manual_image_model) else selected_image_model
+                    image_prompt = st.text_area("Prompt", value="A cinematic cyberpunk city at dusk, ultra detailed")
+                    image_size = st.selectbox("尺寸", options=["1024x1024", "1024x1792", "1792x1024"], index=0)
+                    image_n = st.slider("生成数量", min_value=1, max_value=4, value=1, step=1)
+
+                    if st.button("生成图片", key=f"generate_image_{selected_provider.id}", width="stretch"):
+                        if not image_model:
+                            st.warning("请选择或输入图片模型 ID")
+                        elif not image_prompt.strip():
+                            st.warning("请输入 prompt")
+                        else:
+                            url = f"{selected_provider.api_base.rstrip('/')}/images/generations"
+                            headers = {
+                                "Authorization": f"Bearer {selected_key.key}",
+                                "Content-Type": "application/json",
+                            }
+                            payload = {
+                                "model": image_model,
+                                "prompt": image_prompt,
+                                "n": image_n,
+                                "size": image_size,
+                            }
+                            try:
+                                resp = requests.post(url, headers=headers, json=payload, timeout=180)
+                                if resp.status_code == 200:
+                                    data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                                    images = data.get("data", []) if isinstance(data, dict) else []
+                                    if not images:
+                                        st.warning("返回成功但未解析到图片数据。")
+                                    else:
+                                        for idx, item in enumerate(images):
+                                            st.markdown(f"**图片 {idx + 1}**")
+                                            if item.get("url"):
+                                                img_url = item["url"]
+                                                st.image(img_url, caption=f"{image_model} - {image_size}")
+                                                try:
+                                                    img_resp = requests.get(img_url, timeout=60)
+                                                    if img_resp.status_code == 200:
+                                                        st.download_button(
+                                                            label=f"下载图片 {idx + 1}",
+                                                            data=img_resp.content,
+                                                            file_name=f"{image_model.replace('/', '_')}_{idx+1}.png",
+                                                            mime="image/png",
+                                                            key=f"download_url_img_{selected_provider.id}_{idx}",
+                                                        )
+                                                except Exception:
+                                                    pass
+                                            elif item.get("b64_json"):
+                                                img_bytes = base64.b64decode(item["b64_json"])
+                                                st.image(img_bytes, caption=f"{image_model} - {image_size}")
+                                                st.download_button(
+                                                    label=f"下载图片 {idx + 1}",
+                                                    data=img_bytes,
+                                                    file_name=f"{image_model.replace('/', '_')}_{idx+1}.png",
+                                                    mime="image/png",
+                                                    key=f"download_b64_img_{selected_provider.id}_{idx}",
+                                                )
+                                    log_custom_usage(
+                                        key_id=selected_key.id,
+                                        model_name=image_model,
+                                        images_count=max(1, len(images)),
+                                    )
+                                else:
+                                    st.error(f"请求失败：HTTP {resp.status_code}，{resp.text[:500]}")
+                            except Exception as e:
+                                st.error(f"请求异常：{e}")
+
 elif menu == "系统设置":
     st.header("⚙️ 系统配置")
     st.info("代理后端地址: `http://localhost:8000/v1`")
-    st.text_input("Master API Key", value="sk-admin-123456", type="password", disabled=True)
-    st.checkbox("启用 API Key 验证", value=True, disabled=True)
-    st.caption("注：系统设置目前需通过修改 .env 文件生效。")
+    current_master_key = os.getenv("MASTER_KEY", "sk-admin-123456")
+    new_master_key = st.text_input("Master API Key", value=current_master_key, type="password")
+    auth_enabled_now = os.getenv("AUTH_ENABLED", "true").lower() == "true"
+    new_auth_enabled = st.checkbox("启用 API Key 验证", value=auth_enabled_now)
+    c_save, c_copy = st.columns(2)
+    if c_save.button("保存系统设置", width="stretch"):
+        if not new_master_key.strip():
+            st.error("Master API Key 不能为空")
+        else:
+            upsert_env_value("MASTER_KEY", new_master_key.strip())
+            upsert_env_value("AUTH_ENABLED", "true" if new_auth_enabled else "false")
+            st.success("系统设置已写入 .env，重启服务后生效。")
+    with c_copy:
+        copy_button("一键复制 Master Key", new_master_key, "copy-master-key")
+    st.caption("说明：这里会修改项目根目录 `.env` 文件。")

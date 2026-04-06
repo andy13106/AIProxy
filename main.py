@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -43,6 +44,32 @@ def start_services() -> None:
     )
     backend_process = subprocess.Popen(backend_cmd)
 
+    admin_host = os.getenv("ADMIN_HOST", "0.0.0.0")
+    admin_port = int(os.getenv("ADMIN_PORT", "8501"))
+
+    def _find_available_port(start_port: int, max_tries: int = 20) -> int | None:
+        for port in range(start_port, start_port + max_tries):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if sock.connect_ex(("127.0.0.1", port)) != 0:
+                    return port
+        return None
+
+    selected_admin_port = _find_available_port(admin_port)
+    frontend_process = None
+    frontend_fail_count = 0
+
+    if selected_admin_port is None:
+        print(
+            "Admin panel: no available port found. "
+            f"Checked from {admin_port} to {admin_port + 19}. Skipping admin panel startup."
+        )
+    else:
+        if selected_admin_port != admin_port:
+            print(
+                f"Admin panel port {admin_port} is busy, auto-switched to {selected_admin_port}."
+            )
+
     frontend_cmd = [
         sys.executable,
         "-m",
@@ -50,17 +77,17 @@ def start_services() -> None:
         "run",
         "admin_panel.py",
         "--server.address",
-        os.getenv("ADMIN_HOST", "0.0.0.0"),
+        admin_host,
         "--server.port",
-        os.getenv("ADMIN_PORT", "8501"),
+        str(selected_admin_port or admin_port),
         "--server.headless",
         "true",
+        "--browser.gatherUsageStats",
+        "false",
     ]
-    print(
-        "Admin panel: "
-        f"http://{os.getenv('ADMIN_HOST', '0.0.0.0')}:{os.getenv('ADMIN_PORT', '8501')}"
-    )
-    frontend_process = subprocess.Popen(frontend_cmd)
+    if selected_admin_port is not None:
+        print("Admin panel: " f"http://{admin_host}:{selected_admin_port}")
+        frontend_process = subprocess.Popen(frontend_cmd)
 
     print("\nServices started. Press Ctrl+C to stop.")
 
@@ -69,14 +96,26 @@ def start_services() -> None:
             if backend_process.poll() is not None:
                 print("Backend exited unexpectedly. Restarting...")
                 backend_process = subprocess.Popen(backend_cmd)
-            if frontend_process.poll() is not None:
-                print("Admin panel exited unexpectedly. Restarting...")
-                frontend_process = subprocess.Popen(frontend_cmd)
+            if frontend_process is not None and frontend_process.poll() is not None:
+                frontend_fail_count += 1
+                if frontend_fail_count >= 5:
+                    print(
+                        "Admin panel failed repeatedly (>=5 times). "
+                        "Stopping auto-restart to avoid log spam. "
+                        "Set a free ADMIN_PORT and restart when needed."
+                    )
+                    frontend_process = None
+                else:
+                    delay = min(30, 2 * frontend_fail_count)
+                    print(f"Admin panel exited unexpectedly. Restarting in {delay}s...")
+                    time.sleep(delay)
+                    frontend_process = subprocess.Popen(frontend_cmd)
             time.sleep(5)
     except KeyboardInterrupt:
         print("\nStopping services...")
         backend_process.terminate()
-        frontend_process.terminate()
+        if frontend_process is not None:
+            frontend_process.terminate()
         print("Services stopped.")
 
 

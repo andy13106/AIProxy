@@ -15,10 +15,22 @@ DATABASE_URL = f"sqlite+aiosqlite:///./data/proxy.db"
 # 同步连接用于 Streamlit
 SYNC_DATABASE_URL = f"sqlite:///./data/proxy.db"
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-sync_engine = create_engine(SYNC_DATABASE_URL, echo=False)
+sync_engine = create_engine(
+    SYNC_DATABASE_URL,
+    echo=False,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(sync_engine, expire_on_commit=False)
 
 Base = declarative_base()
