@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 import asyncio
+import ast
 from typing import Optional
 
 import litellm
@@ -20,6 +21,10 @@ MASTER_KEY = os.getenv("MASTER_KEY", "sk-admin-123456")
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
 UPSTREAM_TIMEOUT_SEC = float(os.getenv("UPSTREAM_TIMEOUT_SEC", "180"))
 STREAM_HEARTBEAT_SEC = float(os.getenv("STREAM_HEARTBEAT_SEC", "15"))
+ANTHROPIC_FALLBACK_VIRTUAL_MODEL = os.getenv(
+    "ANTHROPIC_FALLBACK_VIRTUAL_MODEL", "claude-3-5-sonnet-20241022"
+)
+DEFAULT_FALLBACK_VIRTUAL_MODEL = os.getenv("DEFAULT_FALLBACK_VIRTUAL_MODEL", "GLM5")
 
 
 @app.middleware("http")
@@ -201,6 +206,7 @@ def _convert_anthropic_messages_to_openai(messages) -> list:
                     text_parts.append(text)
             elif block_type == "tool_use" and role == "assistant":
                 tool_input = block.get("input", {})
+                tool_input = _normalize_tool_input(block.get("name", "tool"), tool_input)
                 if isinstance(tool_input, str):
                     arguments = tool_input
                 else:
@@ -244,6 +250,96 @@ def _convert_anthropic_messages_to_openai(messages) -> list:
     return converted
 
 
+def _normalize_tool_input(tool_name: str, tool_input):
+    name = (tool_name or "").lower()
+    if isinstance(tool_input, dict):
+        normalized = dict(tool_input)
+    elif isinstance(tool_input, str):
+        text = tool_input.strip()
+        parsed = None
+        if text:
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(text)
+                except Exception:
+                    parsed = None
+        if isinstance(parsed, dict):
+            normalized = dict(parsed)
+        else:
+            normalized = {"raw_arguments": tool_input}
+    else:
+        normalized = {}
+
+    # 某些模型会把真正参数包在 input/args/arguments 字段里，这里先展开一层。
+    for wrapper_key in ("input", "args", "arguments"):
+        wrapped = normalized.get(wrapper_key)
+        if isinstance(wrapped, dict):
+            merged = dict(wrapped)
+            for k, v in normalized.items():
+                if k not in ("input", "args", "arguments") and k not in merged:
+                    merged[k] = v
+            normalized = merged
+            break
+        if isinstance(wrapped, str):
+            text = wrapped.strip()
+            if text:
+                try:
+                    wrapped_obj = json.loads(text)
+                except Exception:
+                    try:
+                        wrapped_obj = ast.literal_eval(text)
+                    except Exception:
+                        wrapped_obj = None
+                if isinstance(wrapped_obj, dict):
+                    merged = dict(wrapped_obj)
+                    for k, v in normalized.items():
+                        if k not in ("input", "args", "arguments") and k not in merged:
+                            merged[k] = v
+                    normalized = merged
+                    break
+
+    # Claude Code / OpenCode 常见 bash 工具参数兼容
+    if "bash" in name and "command" not in normalized:
+        for candidate in ("cmd", "bash_command", "script", "shell_command"):
+            if candidate in normalized and normalized[candidate]:
+                normalized["command"] = normalized[candidate]
+                break
+        if "command" not in normalized and isinstance(normalized.get("commands"), list):
+            normalized["command"] = "\n".join(str(x) for x in normalized["commands"] if x is not None)
+
+    # Glob 工具常见参数兼容：统一补齐 pattern
+    if "glob" in name:
+        pattern = normalized.get("pattern")
+        if not pattern:
+            for candidate in ("query", "search", "glob", "mask", "file_pattern"):
+                value = normalized.get(candidate)
+                if isinstance(value, str) and value.strip():
+                    pattern = value.strip()
+                    break
+
+        if not pattern:
+            for candidate in ("path", "dir", "directory", "cwd", "root", "base_path"):
+                value = normalized.get(candidate)
+                if isinstance(value, str) and value.strip():
+                    base = value.strip().rstrip("/")
+                    pattern = f"{base}/**/*" if base else "**/*"
+                    break
+
+        if not pattern:
+            raw = normalized.get("raw_arguments")
+            if isinstance(raw, str) and raw.strip():
+                pattern = raw.strip()
+
+        if not pattern:
+            pattern = "**/*"
+
+        normalized["pattern"] = pattern
+
+    return normalized
+
+
 def _serialize_response_obj(response):
     if hasattr(response, "model_dump"):
         return response.model_dump(exclude_none=True)
@@ -283,11 +379,16 @@ def _convert_openai_response_to_anthropic(response, model_name: str) -> dict:
             try:
                 tool_input = json.loads(raw_args)
             except Exception:
-                tool_input = {"raw_arguments": raw_args}
+                try:
+                    parsed = ast.literal_eval(raw_args)
+                    tool_input = parsed if isinstance(parsed, dict) else {"raw_arguments": raw_args}
+                except Exception:
+                    tool_input = {"raw_arguments": raw_args}
         elif isinstance(raw_args, dict):
             tool_input = raw_args
         else:
             tool_input = {}
+        tool_input = _normalize_tool_input(function_data.get("name", "tool"), tool_input)
 
         blocks.append(
             {
@@ -297,6 +398,11 @@ def _convert_openai_response_to_anthropic(response, model_name: str) -> dict:
                 "input": tool_input,
             }
         )
+        if "glob" in (function_data.get("name", "").lower()):
+            print(
+                "DEBUG: Normalized glob tool_use input: "
+                f"{json.dumps(tool_input, ensure_ascii=False)}"
+            )
 
     if not blocks:
         blocks = [{"type": "text", "text": ""}]
@@ -424,8 +530,35 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
         mapping_data = result.first()
 
         if not mapping_data:
-            print(f"ERROR: Model '{model_name}' not found in database")
-            raise HTTPException(status_code=404, detail=f"Model {model_name} not mapped.")
+            if is_anthropic and isinstance(model_name, str) and model_name.startswith("claude-"):
+                fallback_candidates = []
+                for candidate in [
+                    DEFAULT_FALLBACK_VIRTUAL_MODEL,
+                    ANTHROPIC_FALLBACK_VIRTUAL_MODEL,
+                    "claude-sonnet-4-20250514",
+                    "GLM5",
+                ]:
+                    if candidate and candidate not in fallback_candidates:
+                        fallback_candidates.append(candidate)
+                for fallback_name in fallback_candidates:
+                    fallback_stmt = (
+                        select(ModelMapping, Provider)
+                        .join(Provider)
+                        .where(ModelMapping.virtual_name == fallback_name)
+                    )
+                    fallback_result = await session.execute(fallback_stmt)
+                    fallback_mapping_data = fallback_result.first()
+                    if fallback_mapping_data:
+                        mapping_data = fallback_mapping_data
+                        print(
+                            "WARN: Model '%s' not mapped. Fallback to '%s'."
+                            % (model_name, fallback_name)
+                        )
+                        break
+
+            if not mapping_data:
+                print(f"ERROR: Model '{model_name}' not found in database")
+                raise HTTPException(status_code=404, detail=f"Model {model_name} not mapped.")
 
         mapping, provider = mapping_data
 
@@ -556,9 +689,30 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                                     )
                                 yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": idx})
                             elif block.get("type") == "tool_use":
+                                tool_input = block.get("input")
+                                if not isinstance(tool_input, dict):
+                                    tool_input = {}
+                                input_json = json.dumps(tool_input, ensure_ascii=False)
                                 yield _sse_event(
                                     "content_block_start",
-                                    {"type": "content_block_start", "index": idx, "content_block": block},
+                                    {
+                                        "type": "content_block_start",
+                                        "index": idx,
+                                        "content_block": {
+                                            "type": "tool_use",
+                                            "id": block.get("id"),
+                                            "name": block.get("name"),
+                                            "input": {},
+                                        },
+                                    },
+                                )
+                                yield _sse_event(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": idx,
+                                        "delta": {"type": "input_json_delta", "partial_json": input_json},
+                                    },
                                 )
                                 yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": idx})
 

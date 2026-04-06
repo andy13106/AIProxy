@@ -6,6 +6,7 @@ import pandas as pd
 import datetime
 import requests
 import os
+import json
 
 # --- 数据库初始化 ---
 # 仅在第一次运行时初始化
@@ -507,52 +508,49 @@ elif menu == "工具配置助手":
     with SessionLocal() as session:
         mappings = session.query(ModelMapping).all()
         v_models = [m.virtual_name for m in mappings]
-        
-    model_hint = v_models[0] if v_models else "GLM5"
-    opencode_config_content = (
-        '{\n'
-        '  "$schema": "https://opencode.ai/config.json",\n'
-        '  "provider": {\n'
-        '    "aiproxy": {\n'
-        '      "npm": "@ai-sdk/openai-compatible",\n'
-        '      "name": "AIProxy",\n'
-        '      "options": {\n'
-        f'        "baseURL": "{proxy_url_v1}",\n'
-        '        "apiKey": "{env:AIPROXY_KEY}"\n'
-        '      },\n'
-        '      "models": {\n'
-        f'        "{model_hint}": {{\n'
-        f'          "name": "{model_hint}"\n'
-        '        }\n'
-        '      }\n'
-        '    }\n'
-        '  }\n'
-        '}'
-    )
-    opencode_start_content = (
-        f"$env:AIPROXY_KEY='{master_key}'\n"
-        "$env:OPENCODE_CONFIG='opencode.json'\n"
-        "Write-Host 'Starting OpenCode with AIProxy...' -ForegroundColor Cyan\n"
-        "Write-Host \"Config: $env:OPENCODE_CONFIG\" -ForegroundColor DarkGray\n"
-        f"Write-Host 'Model: aiproxy/{model_hint}' -ForegroundColor DarkGray\n"
-        f"opencode -m aiproxy/{model_hint}\n"
-        "Write-Host ''\n"
-        "Read-Host 'OpenCode exited. Press Enter to close'"
-    )
-    claude_settings_content = (
-        '{\n'
-        '  "$schema": "https://json.schemastore.org/claude-code-settings.json",\n'
-        '  "env": {\n'
-        f'    "ANTHROPIC_BASE_URL": "{base_host}",\n'
-        f'    "ANTHROPIC_API_KEY": "{master_key}"\n'
-        '  }\n'
-        '}'
-    )
+    
+    model_list = sorted(set(v_models)) if v_models else ["GLM5"]
+    model_hint = "GLM5" if "GLM5" in model_list else model_list[0]
+
+    opencode_models_dict = {m: {"name": m} for m in model_list}
+    opencode_config_data = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            "aiproxy": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "AIProxy",
+                "options": {
+                    "baseURL": proxy_url_v1,
+                    "apiKey": "{env:AIPROXY_KEY}",
+                },
+                "models": opencode_models_dict,
+            }
+        },
+    }
+    opencode_config_content = json.dumps(opencode_config_data, ensure_ascii=False, indent=2)
 
     t1, t2, t3, t4 = st.tabs(["Claude Code", "OpenCode", "Cursor / Trae", "Other Tools"])
     
     with t1:
         st.subheader("Claude Code 配置与启动")
+        selected_claude_model = st.selectbox(
+            "选择 Claude Code 默认模型",
+            options=model_list,
+            index=model_list.index(model_hint) if model_hint in model_list else 0,
+            key="claude_default_model",
+        )
+        claude_settings_content = json.dumps(
+            {
+                "$schema": "https://json.schemastore.org/claude-code-settings.json",
+                "env": {
+                    "ANTHROPIC_BASE_URL": base_host,
+                    "ANTHROPIC_API_KEY": master_key,
+                },
+                "model": selected_claude_model,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
         st.markdown(f"""
         Claude Code 需要通过设置 Anthropic 的环境变量来指向本地代理。
         这里的 Key 是**本地代理服务的访问 Key**，不是上游平台的 Key。
@@ -563,17 +561,17 @@ elif menu == "工具配置助手":
         """)
         
         if st.button("生成一键启动脚本 (claude_start.ps1)"):
-            script_content = f"$env:ANTHROPIC_BASE_URL='{base_host}'; $env:ANTHROPIC_API_KEY='{master_key}'; claude --model {model_hint}"
+            script_content = f"$env:ANTHROPIC_BASE_URL='{base_host}'; $env:ANTHROPIC_API_KEY='{master_key}'; claude --model {selected_claude_model}"
             with open("claude_start.ps1", "w", encoding="utf-8") as f:
                 f.write(script_content)
             st.success(f"脚本已生成！请右键运行 `claude_start.ps1`。")
-            st.info(f"注意：脚本默认使用了模型 `{model_hint}`。")
+            st.info(f"注意：脚本默认使用了模型 `{selected_claude_model}`。")
 
         st.markdown("""
         **2. 手动运行命令**:
         在 PowerShell 中运行以下命令：
         """)
-        st.code(f"$env:ANTHROPIC_BASE_URL='{base_host}'; $env:ANTHROPIC_API_KEY='{master_key}'; claude --model {model_hint}", language="powershell")
+        st.code(f"$env:ANTHROPIC_BASE_URL='{base_host}'; $env:ANTHROPIC_API_KEY='{master_key}'; claude --model {selected_claude_model}", language="powershell")
 
         st.markdown("""
         **3. 配置文件方式**:
@@ -594,6 +592,22 @@ elif menu == "工具配置助手":
 
     with t2:
         st.subheader("OpenCode 配置与启动")
+        selected_opencode_model = st.selectbox(
+            "选择 OpenCode 启动模型",
+            options=model_list,
+            index=model_list.index(model_hint) if model_hint in model_list else 0,
+            key="opencode_default_model",
+        )
+        opencode_start_content = (
+            f"$env:AIPROXY_KEY='{master_key}'\n"
+            "$env:OPENCODE_CONFIG='opencode.json'\n"
+            "Write-Host 'Starting OpenCode with AIProxy...' -ForegroundColor Cyan\n"
+            "Write-Host \"Config: $env:OPENCODE_CONFIG\" -ForegroundColor DarkGray\n"
+            f"Write-Host 'Model: aiproxy/{selected_opencode_model}' -ForegroundColor DarkGray\n"
+            f"opencode -m aiproxy/{selected_opencode_model}\n"
+            "Write-Host ''\n"
+            "Read-Host 'OpenCode exited. Press Enter to close'"
+        )
         st.markdown(f"""
         OpenCode 更适合通过 OpenAI 兼容 Provider 配置接入本地代理。
         这里的 Key 同样是**本地代理访问 Key**，不是上游平台的 Key。
@@ -618,14 +632,14 @@ elif menu == "工具配置助手":
             with open("opencode_start.ps1", "w", encoding="utf-8") as f:
                 f.write(opencode_start_content)
             st.success("脚本已生成：`opencode_start.ps1`")
-            st.info(f"默认启动模型：`aiproxy/{model_hint}`")
+            st.info(f"默认启动模型：`aiproxy/{selected_opencode_model}`")
 
         st.markdown("""
         **3. 手动运行命令**:
         在 PowerShell 中运行以下命令：
         """)
         st.code(
-            f"$env:AIPROXY_KEY='{master_key}'; $env:OPENCODE_CONFIG='opencode.json'; opencode -m aiproxy/{model_hint}",
+            f"$env:AIPROXY_KEY='{master_key}'; $env:OPENCODE_CONFIG='opencode.json'; opencode -m aiproxy/{selected_opencode_model}",
             language="powershell"
         )
 
