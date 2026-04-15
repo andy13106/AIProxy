@@ -10,6 +10,14 @@ import os
 import json
 import base64
 
+from config_assistant.env_detector import is_running_in_docker
+from config_assistant.config_detector import ConfigDetector
+from config_assistant.backup_manager import BackupManager
+from config_assistant.injectors.claude_code import ClaudeCodeInjector
+from config_assistant.injectors.opencode import OpenCodeInjector
+from config_assistant.injectors.openclaw import OpenClawInjector
+from config_assistant.ai_analyzer import AIAnalyzer
+
 # --- 数据库初始化 ---
 # 仅在第一次运行时初始化
 if 'db_initialized' not in st.session_state:
@@ -673,10 +681,7 @@ elif menu == "模型映射管理":
 
 elif menu == "工具配置助手":
     st.header("🛠️ AI 工具配置助手")
-    st.info("帮助您将本地代理一键配置到常用的 AI 编程工具中。")
     
-    # 获取当前配置
-    # 实际应用中这些应当来自环境变量或数据库
     base_host = "http://localhost:8000"
     proxy_url_v1 = f"{base_host}/v1"
     master_key = os.getenv("MASTER_KEY", "sk-admin-123456")
@@ -687,23 +692,255 @@ elif menu == "工具配置助手":
     
     model_list = sorted(set(v_models)) if v_models else ["GLM5"]
     model_hint = "GLM5" if "GLM5" in model_list else model_list[0]
-
-    opencode_models_dict = {m: {"name": m} for m in model_list}
-    opencode_config_data = {
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {
-            "aiproxy": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "AIProxy",
-                "options": {
-                    "baseURL": proxy_url_v1,
-                    "apiKey": master_key,
-                },
-                "models": opencode_models_dict,
-            }
-        },
-    }
-    opencode_config_content = json.dumps(opencode_config_data, ensure_ascii=False, indent=2)
+    
+    running_in_docker = is_running_in_docker()
+    
+    if running_in_docker:
+        st.warning("""
+        ⚠️ **Docker环境检测到**
+        
+        自动配置功能需要直接访问宿主机文件系统，当前运行在Docker容器中，
+        **无法自动修改您的本地AI工具配置文件**。
+        
+        请使用以下方式之一：
+        1. 下载配置文件，手动复制到工具配置目录
+        2. 在本机直接运行项目（python + streamlit方式）
+        3. 使用下方的手动配置说明
+        """)
+        st.divider()
+    
+    if not running_in_docker:
+        st.subheader("🤖 智能配置")
+        st.info("自动扫描并配置本地AI工具，实现零手动配置体验。")
+        
+        config_detector = ConfigDetector()
+        backup_manager = BackupManager()
+        
+        if "scan_result" not in st.session_state:
+            st.session_state.scan_result = None
+        if "selected_tools" not in st.session_state:
+            st.session_state.selected_tools = {}
+        
+        c_scan, c_restore = st.columns([3, 1])
+        with c_scan:
+            if st.button("🔍 一键智能扫描配置文件", type="primary", width="stretch"):
+                with st.spinner("AI正在扫描系统中的配置文件..."):
+                    st.session_state.scan_result = config_detector.detect_all()
+        with c_restore:
+            if st.button("↩️ 一键恢复备份", width="stretch"):
+                backups = backup_manager.list_backups()
+                if backups:
+                    st.session_state.show_restore = True
+                else:
+                    st.info("暂无备份文件可恢复")
+        
+        if st.session_state.get("show_restore", False):
+            with st.expander("选择备份文件恢复", expanded=True):
+                backups = backup_manager.list_backups()
+                if backups:
+                    for b in backups[:5]:
+                        col1, col2 = st.columns([4, 1])
+                        col1.write(f"📄 {b['filename']}")
+                        if col2.button("恢复", key=f"restore_{b['filename']}"):
+                            st.info("请手动选择要恢复到的配置文件路径")
+                st.button("关闭恢复面板", on_click=lambda: st.session_state.__setitem__("show_restore", False))
+        
+        if st.session_state.scan_result:
+            st.markdown("---")
+            st.markdown("**检测结果：**")
+            
+            detected_any = False
+            for tool_id, result in st.session_state.scan_result.items():
+                col1, col2, col3, col4 = st.columns([1, 3, 5, 2])
+                if result["found"]:
+                    detected_any = True
+                    col1.success("✅")
+                    col2.write(f"**{result['display_name']}**")
+                    col3.code(result["path"], language="text")
+                    default_checked = tool_id in ["claude_code", "opencode"]
+                    st.session_state.selected_tools[tool_id] = col4.checkbox(
+                        "自动配置",
+                        value=default_checked,
+                        key=f"check_{tool_id}"
+                    )
+                else:
+                    col1.error("❌")
+                    col2.write(f"**{result['display_name']}**")
+                    col3.caption(f"未检测到，标准位置: {result['config_path_hint']}")
+                    st.session_state.selected_tools[tool_id] = col4.checkbox(
+                        "创建并配置",
+                        value=False,
+                        key=f"check_create_{tool_id}"
+                    )
+            
+            st.markdown("---")
+            
+            selected_count = sum(1 for v in st.session_state.selected_tools.values() if v)
+            if selected_count > 0:
+                st.caption(f"已选择 {selected_count} 个工具进行自动配置")
+                tool_hints = []
+                if st.session_state.selected_tools.get("claude_code"):
+                    tool_hints.append(f"ClaudeCode (默认模型: {model_hint})")
+                if st.session_state.selected_tools.get("opencode"):
+                    tool_hints.append(f"OpenCode (注入 {len(model_list)} 个代理模型)")
+                if st.session_state.selected_tools.get("openclaw"):
+                    tool_hints.append("OpenClaw")
+                if tool_hints:
+                    st.info("将为以下工具执行配置：\n- " + "\n- ".join(tool_hints))
+                
+                col_exec, col_preview = st.columns(2)
+                if col_exec.button("✅ 确认执行配置", width="stretch"):
+                    success_count = 0
+                    fail_count = 0
+                    messages = []
+                    
+                    with st.spinner("正在配置..."):
+                        for tool_id, selected in st.session_state.selected_tools.items():
+                            if not selected:
+                                continue
+                            
+                            result = st.session_state.scan_result[tool_id]
+                            config_path = result["path"] or config_detector.get_tool_config_path(tool_id)
+                            
+                            if result["path"]:
+                                backup_path = backup_manager.create_backup(config_path)
+                                if backup_path:
+                                    messages.append(f"✅ [{result['display_name']}] 已备份: {os.path.basename(backup_path)}")
+                            
+                            config_detector.ensure_config_dir(tool_id)
+                            
+                            injector = None
+                            if tool_id == "claude_code":
+                                injector = ClaudeCodeInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
+                            elif tool_id == "opencode":
+                                injector = OpenCodeInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
+                            elif tool_id == "openclaw":
+                                injector = OpenClawInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
+                            
+                            if injector:
+                                ok, err = injector.inject()
+                                if ok:
+                                    save_ok, save_err = injector.save_config()
+                                    if save_ok:
+                                        if backup_manager.validate_json(config_path):
+                                            success_count += 1
+                                            messages.append(f"✅ [{result['display_name']}] 配置写入成功")
+                                            messages.append(injector.generate_description())
+                                        else:
+                                            fail_count += 1
+                                            backup_manager.restore_latest(tool_id, config_path)
+                                            messages.append(f"❌ [{result['display_name']}] 配置验证失败，已自动回滚")
+                                    else:
+                                        fail_count += 1
+                                        messages.append(f"❌ [{result['display_name']}] 写入失败: {save_err}")
+                                else:
+                                    fail_count += 1
+                                    messages.append(f"❌ [{result['display_name']}] 注入失败: {err}")
+                    
+                    st.divider()
+                    if fail_count == 0:
+                        st.success(f"🎉 全部配置完成！成功 {success_count} 个工具")
+                    else:
+                        st.warning(f"配置完成: 成功 {success_count} 个，失败 {fail_count} 个")
+                    
+                    for msg in messages:
+                        if msg.startswith("✅"):
+                            st.write(msg)
+                        elif msg.startswith("❌"):
+                            st.error(msg)
+                        else:
+                            st.caption(msg)
+                
+                if col_preview.button("👁️ 查看配置变更预览", width="stretch"):
+                    st.session_state.show_preview = True
+                
+                if st.session_state.get("show_preview", False):
+                    with st.expander("配置变更预览", expanded=True):
+                        for tool_id, selected in st.session_state.selected_tools.items():
+                            if not selected:
+                                continue
+                            result = st.session_state.scan_result[tool_id]
+                            config_path = result["path"] or config_detector.get_tool_config_path(tool_id)
+                            
+                            injector = None
+                            if tool_id == "claude_code":
+                                injector = ClaudeCodeInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
+                            elif tool_id == "opencode":
+                                injector = OpenCodeInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
+                            elif tool_id == "openclaw":
+                                injector = OpenClawInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
+                            
+                            if injector:
+                                injector.inject()
+                                st.markdown(f"**{result['display_name']}**")
+                                st.info(injector.generate_description())
+                                col_orig, col_mod = st.columns(2)
+                                col_orig.caption("原始配置")
+                                col_orig.json(injector.original_config)
+                                col_mod.caption("修改后配置")
+                                col_mod.json(injector.modified_config)
+                                st.markdown("---")
+                        if st.button("关闭预览"):
+                            st.session_state.show_preview = False
+            else:
+                st.info("请选择至少一个工具进行配置")
+        
+        st.divider()
+        st.subheader("📋 手动配置")
+        st.info("高级用户可以使用手动配置方式，生成配置示例和启动脚本。")
+    
+        opencode_models_dict = {m: {"name": m} for m in model_list}
+        opencode_config_data = {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+                "aiproxy": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "AIProxy",
+                    "options": {
+                        "baseURL": proxy_url_v1,
+                        "apiKey": master_key,
+                    },
+                    "models": opencode_models_dict,
+                }
+            },
+        }
+        opencode_config_content = json.dumps(opencode_config_data, ensure_ascii=False, indent=2)
 
     t1, t2, t3, t4 = st.tabs(["Claude Code", "OpenCode", "Cursor / Trae", "Other Tools"])
     

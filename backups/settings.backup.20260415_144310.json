@@ -1,0 +1,7 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8000",
+    "ANTHROPIC_API_KEY": "sk-admin-123456"
+  },
+  "model": "GLM5"
+}
