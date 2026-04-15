@@ -672,8 +672,12 @@ elif menu == "模型映射管理":
             st.info("尚未配置模型映射")
 
 elif menu == "工具配置助手":
-    st.header("🛠️ AI 工具配置助手")
-    st.info("帮助您将本地代理一键配置到常用的 AI 编程工具中。")
+    from pages.tool_config_assistant import render_tool_config_assistant
+    render_tool_config_assistant()
+
+elif menu == "模型体验":
+    st.header("🎛️ 模型体验")
+    st.info("直接使用供应商模型列表进行文本对话和图片生成（不依赖映射列表），并计入使用概览统计。")
     
     # 获取当前配置
     # 实际应用中这些应当来自环境变量或数据库
