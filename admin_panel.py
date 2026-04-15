@@ -10,6 +10,16 @@ import os
 import json
 import base64
 
+# --- 导入配置助手模块 ---
+from config_assistant import (
+    ConfigDetector,
+    BackupManager,
+    ModelsSync,
+    ClaudeCodeInjector,
+    OpenCodeInjector,
+    OpenClawInjector,
+)
+
 # --- 数据库初始化 ---
 # 仅在第一次运行时初始化
 if 'db_initialized' not in st.session_state:
@@ -674,19 +684,308 @@ elif menu == "模型映射管理":
 elif menu == "工具配置助手":
     st.header("🛠️ AI 工具配置助手")
     st.info("帮助您将本地代理一键配置到常用的 AI 编程工具中。")
-    
+
     # 获取当前配置
-    # 实际应用中这些应当来自环境变量或数据库
     base_host = "http://localhost:8000"
     proxy_url_v1 = f"{base_host}/v1"
     master_key = os.getenv("MASTER_KEY", "sk-admin-123456")
-    
+
     with SessionLocal() as session:
         mappings = session.query(ModelMapping).all()
         v_models = [m.virtual_name for m in mappings]
-    
+
     model_list = sorted(set(v_models)) if v_models else ["GLM5"]
     model_hint = "GLM5" if "GLM5" in model_list else model_list[0]
+
+    # --- 智能配置区域 ---
+    st.divider()
+    st.subheader("🤖 智能自动配置")
+
+    # 初始化配置助手
+    config_detector = ConfigDetector()
+    backup_manager = BackupManager()
+    models_sync = ModelsSync()
+
+    # 检测Docker环境
+    in_docker = config_detector.is_running_in_docker()
+
+    if in_docker:
+        st.warning("""
+        ⚠️ **Docker环境检测到**
+
+        自动配置功能需要直接访问宿主机文件系统，当前运行在Docker容器中，
+        **无法自动修改您的本地AI工具配置文件**。
+
+        请使用以下方式之一：
+        1. 下载配置文件，手动复制到工具配置目录
+        2. 在本机直接运行项目（python + streamlit方式）
+        3. 使用下方的手动配置说明
+        """)
+    else:
+        st.success("✅ 本地运行环境，支持自动配置")
+
+        # 配置文件扫描
+        if st.button("🔍 扫描系统中的配置文件", type="primary"):
+            with st.spinner("正在扫描..."):
+                detection_results = config_detector.get_detected_tools_summary()
+
+            st.session_state["config_detection_results"] = detection_results
+
+            # 显示扫描结果
+            st.markdown("#### 扫描结果")
+
+            for tool in detection_results["detected"]:
+                st.success(f"✅ 找到 **{tool['name']}** 配置：`{tool['path']}`")
+
+            for tool in detection_results["not_detected"]:
+                st.info(f"❌ 未检测到 **{tool['name']}** 配置 (建议位置：`{tool['suggested_path']}`)")
+
+        # 如果有扫描结果，显示配置选项
+        if "config_detection_results" in st.session_state:
+            detection_results = st.session_state["config_detection_results"]
+
+            st.markdown("---")
+            st.markdown("#### 选择要配置的工具")
+
+            # 构建工具选择
+            tools_to_configure = {}
+
+            # Claude Code
+            claude_info = detection_results["details"].get("claude_code")
+            if claude_info and claude_info.exists:
+                default_model = models_sync.get_default_model()
+                tools_to_configure["claude_code"] = st.checkbox(
+                    f"**Claude Code** (将设置默认模型为 {default_model})",
+                    value=True
+                )
+            else:
+                st.checkbox("**Claude Code** (未检测到配置文件)", value=False, disabled=True)
+
+            # OpenCode
+            opencode_info = detection_results["details"].get("opencode")
+            models_count = models_sync.get_models_count()
+            if opencode_info and opencode_info.exists:
+                tools_to_configure["opencode"] = st.checkbox(
+                    f"**OpenCode** (将注入 {models_count} 个代理模型)",
+                    value=True
+                )
+            else:
+                st.checkbox("**OpenCode** (未检测到配置文件)", value=False, disabled=True)
+
+            # OpenClaw
+            openclaw_info = detection_results["details"].get("openclaw")
+            if openclaw_info and openclaw_info.exists:
+                tools_to_configure["openclaw"] = st.checkbox(
+                    f"**OpenClaw** (将注入 {models_count} 个代理模型)",
+                    value=False
+                )
+            else:
+                st.checkbox("**OpenClaw** (未检测到配置文件)", value=False, disabled=True)
+
+            # 配置预览和执行
+            if any(tools_to_configure.values()):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    if st.button("👁️ 查看配置变更预览", use_container_width=True):
+                        # 使用expander来组织对比内容
+                        if tools_to_configure.get("claude_code"):
+                            with st.expander("Claude Code 配置对比", expanded=True):
+                                injector = ClaudeCodeInjector(backup_manager)
+                                original = injector.get_current_config()
+                                target = models_sync.generate_claude_code_config()
+                                merged = injector.merge_configs(original or {}, target)
+
+                                col_orig, col_new = st.columns(2)
+                                with col_orig:
+                                    st.markdown("**📄 原配置**")
+                                    if original:
+                                        st.code(json.dumps(original, ensure_ascii=False, indent=2), language="json")
+                                    else:
+                                        st.info("(文件不存在，将创建新配置)")
+                                with col_new:
+                                    st.markdown("**✨ 新配置**")
+                                    st.code(json.dumps(merged, ensure_ascii=False, indent=2), language="json")
+
+                        if tools_to_configure.get("opencode"):
+                            with st.expander("OpenCode 配置对比", expanded=True):
+                                injector = OpenCodeInjector(backup_manager)
+                                original = injector.get_current_config()
+                                target = models_sync.generate_opencode_config()
+                                merged = injector.merge_configs(original or {}, target)
+
+                                col_orig, col_new = st.columns(2)
+                                with col_orig:
+                                    st.markdown("**📄 原配置**")
+                                    if original:
+                                        st.code(json.dumps(original, ensure_ascii=False, indent=2), language="json")
+                                    else:
+                                        st.info("(文件不存在，将创建新配置)")
+                                with col_new:
+                                    st.markdown("**✨ 新配置**")
+                                    st.code(json.dumps(merged, ensure_ascii=False, indent=2), language="json")
+
+                        if tools_to_configure.get("openclaw"):
+                            with st.expander("OpenClaw 配置对比", expanded=True):
+                                injector = OpenClawInjector(backup_manager)
+                                original = injector.get_current_config()
+                                target = models_sync.generate_openclaw_config()
+                                merged = injector.merge_configs(original or {}, target)
+
+                                col_orig, col_new = st.columns(2)
+                                with col_orig:
+                                    st.markdown("**📄 原配置**")
+                                    if original:
+                                        st.code(json.dumps(original, ensure_ascii=False, indent=2), language="json")
+                                    else:
+                                        st.info("(文件不存在，将创建新配置)")
+                                with col_new:
+                                    st.markdown("**✨ 新配置**")
+                                    st.code(json.dumps(merged, ensure_ascii=False, indent=2), language="json")
+
+                with col2:
+                    if st.button("⚡ 执行自动配置", type="primary", use_container_width=True):
+                        results = []
+
+                        # 配置 Claude Code
+                        if tools_to_configure.get("claude_code"):
+                            injector = ClaudeCodeInjector(backup_manager)
+                            result = injector.inject_config()
+                            if result.success:
+                                st.success(f"✅ Claude Code: {result.message}")
+                                if result.backup_path:
+                                    st.caption(f"备份: `{result.backup_path}`")
+                            else:
+                                st.error(f"❌ Claude Code: {result.message}")
+                            results.append(("Claude Code", result.success))
+
+                        # 配置 OpenCode
+                        if tools_to_configure.get("opencode"):
+                            injector = OpenCodeInjector(backup_manager)
+                            result = injector.inject_config()
+                            if result.success:
+                                st.success(f"✅ OpenCode: {result.message}")
+                                if result.backup_path:
+                                    st.caption(f"备份: `{result.backup_path}`")
+                            else:
+                                st.error(f"❌ OpenCode: {result.message}")
+                            results.append(("OpenCode", result.success))
+
+                        # 配置 OpenClaw
+                        if tools_to_configure.get("openclaw"):
+                            injector = OpenClawInjector(backup_manager)
+                            result = injector.inject_config()
+                            if result.success:
+                                st.success(f"✅ OpenClaw: {result.message}")
+                                if result.backup_path:
+                                    st.caption(f"备份: `{result.backup_path}`")
+                            else:
+                                st.error(f"❌ OpenClaw: {result.message}")
+                            results.append(("OpenClaw", result.success))
+
+                        # 总结
+                        success_count = sum(1 for _, success in results if success)
+                        total_count = len(results)
+                        if success_count == total_count:
+                            st.balloons()
+                            st.success(f"🎉 全部配置成功！({success_count}/{total_count})")
+                        else:
+                            st.warning(f"⚠️ 部分配置成功 ({success_count}/{total_count})")
+
+    # 备份管理
+    st.divider()
+    with st.expander("📦 备份管理", expanded=False):
+        # 扫描所有可能的备份位置
+        all_backups = []
+
+        # 从注入器获取配置路径来查找备份
+        injectors = {
+            "Claude Code": ClaudeCodeInjector(backup_manager),
+            "OpenCode": OpenCodeInjector(backup_manager),
+            "OpenClaw": OpenClawInjector(backup_manager),
+        }
+
+        for tool_name, injector in injectors.items():
+            config_path = injector.get_default_config_path()
+            config_dir = os.path.dirname(config_path)
+            if os.path.exists(config_dir):
+                tool_backups = backup_manager.list_backups(config_dir)
+                for backup in tool_backups:
+                    backup["tool"] = tool_name
+                    backup["config_path"] = config_path
+                    all_backups.append(backup)
+
+        # 也去backup_dir查找
+        if backup_manager.backup_dir and os.path.exists(backup_manager.backup_dir):
+            dir_backups = backup_manager.list_backups(backup_manager.backup_dir)
+            for backup in dir_backups:
+                if "tool" not in backup:
+                    backup["tool"] = "未知"
+                    backup["config_path"] = ""
+                all_backups.append(backup)
+
+        # 去重并按时间排序
+        seen_paths = set()
+        unique_backups = []
+        for backup in sorted(all_backups, key=lambda x: x["modified"], reverse=True):
+            if backup["path"] not in seen_paths:
+                seen_paths.add(backup["path"])
+                unique_backups.append(backup)
+
+        if unique_backups:
+            st.markdown(f"找到 {len(unique_backups)} 个备份文件")
+
+            # 按工具分组显示
+            for backup in unique_backups[:10]:  # 只显示最近10个
+                with st.container():
+                    col1, col2, col3, col4 = st.columns([2, 2, 1.5, 1])
+
+                    tool_name = backup.get("tool", "未知")
+                    col1.markdown(f"**{tool_name}**")
+                    col2.caption(f"{backup['filename']}")
+                    col3.caption(f"{backup['modified']}")
+
+                    # 恢复按钮
+                    if col4.button("恢复", key=f"restore_{backup['filename']}"):
+                        # 尝试确定恢复目标路径
+                        target_path = backup.get("config_path")
+                        if not target_path:
+                            # 从备份文件名解析
+                            target_path = backup_manager._parse_original_path_from_backup(backup['path'])
+
+                        success, msg = backup_manager.restore_from_backup(backup['path'], target_path)
+                        if success:
+                            st.success(f"✅ {msg}")
+                        else:
+                            st.error(f"❌ {msg}")
+
+                    # 显示备份内容预览
+                    with st.expander("查看备份内容", expanded=False):
+                        try:
+                            with open(backup['path'], 'r', encoding='utf-8') as f:
+                                content = f.read()
+                                st.code(content, language="json")
+                        except Exception as e:
+                            st.error(f"无法读取备份: {e}")
+
+            # 清理旧备份按钮
+            if len(unique_backups) > 5:
+                if st.button("🧹 清理旧备份（只保留最近5个）"):
+                    deleted = 0
+                    for backup in unique_backups[5:]:
+                        try:
+                            os.remove(backup['path'])
+                            deleted += 1
+                        except:
+                            pass
+                    st.success(f"已清理 {deleted} 个旧备份")
+                    st.rerun()
+        else:
+            st.info("暂无备份文件")
+            st.caption("备份文件会在自动配置修改前自动创建，格式：文件名.backup.时间戳.json")
+
+    st.divider()
+    st.subheader("📖 手动配置指南")
 
     opencode_models_dict = {m: {"name": m} for m in model_list}
     opencode_config_data = {
