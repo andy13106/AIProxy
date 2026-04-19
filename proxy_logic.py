@@ -8,6 +8,7 @@ import litellm
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
 
 from config import logger, request_id_ctx, settings
 from converters import (
@@ -18,7 +19,7 @@ from converters import (
     extract_text_from_content_blocks,
     mask_secret,
 )
-from db import AsyncSessionLocal, init_db
+from db import AsyncSessionLocal, ModelMapping, init_db
 from services import (
     build_completion_params,
     clean_config_value,
@@ -87,6 +88,56 @@ async def verify_auth(credentials: HTTPAuthorizationCredentials = Security(secur
     if credentials.credentials != settings.master_key:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return True
+
+
+def _extract_api_key_from_request(request: Request) -> Optional[str]:
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    x_api_key = request.headers.get("x-api-key")
+    if x_api_key:
+        return x_api_key.strip()
+    return None
+
+
+def _require_api_key_for_models(request: Request) -> None:
+    if not settings.auth_enabled:
+        return
+    incoming_key = _extract_api_key_from_request(request)
+    if not incoming_key or incoming_key != settings.master_key:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+
+
+@app.get("/v1/models")
+@app.get("/models")
+@app.get("/v1/v1/models")
+async def list_proxy_models(request: Request):
+    """OpenAI 兼容模型列表接口，返回已映射的虚拟模型名"""
+    _require_api_key_for_models(request)
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ModelMapping.virtual_name).order_by(ModelMapping.virtual_name.asc()))
+        names = [row[0] for row in result.all() if row and row[0]]
+
+    uniq_names = []
+    seen = set()
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            uniq_names.append(name)
+
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "aiproxy",
+            }
+            for name in uniq_names
+        ],
+    }
 
 
 @app.post("/v1/chat/completions")

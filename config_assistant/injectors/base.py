@@ -1,4 +1,5 @@
 import json
+import copy
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -31,7 +32,9 @@ class BaseInjector(ABC):
                     self.original_config = json.load(f)
             else:
                 self.original_config = {}
-            self.modified_config = self.original_config.copy()
+            # 必须深拷贝，否则修改 modified_config 时会污染 original_config，
+            # 导致“变更预览”里原始配置与修改后配置看起来一样。
+            self.modified_config = copy.deepcopy(self.original_config)
             return True
         except (json.JSONDecodeError, UnicodeDecodeError, IOError):
             return False

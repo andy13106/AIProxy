@@ -48,7 +48,7 @@ class BackupManager:
     def list_backups(self, tool_id: Optional[str] = None) -> List[Dict]:
         """列出所有备份文件"""
         backups = []
-        for f in self.backup_dir.glob("*.backup.*.json"):
+        for f in self.backup_dir.glob("*.backup.*"):
             try:
                 stat = f.stat()
                 backups.append({
@@ -81,7 +81,15 @@ class BackupManager:
 
     def restore_latest(self, tool_id: str, target_path: str) -> bool:
         """恢复某个工具的最新备份"""
-        backups = self.list_backups(tool_id)
+        target = Path(target_path)
+        expected_prefix = f"{target.stem}.backup."
+        expected_suffix = target.suffix
+        backups = [
+            b
+            for b in self.list_backups(tool_id)
+            if Path(b["filename"]).name.startswith(expected_prefix)
+            and Path(b["filename"]).suffix == expected_suffix
+        ]
         if not backups:
             return False
         return self.restore_backup(backups[0]["path"], target_path)
@@ -106,3 +114,13 @@ class BackupManager:
             except Exception:
                 pass
         return removed
+
+    def validate_config_file(self, file_path: str) -> bool:
+        """按后缀做配置文件合法性校验（json 强校验，其它做存在性校验）"""
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return False
+
+        if path.suffix.lower() == ".json":
+            return self.validate_json(file_path)
+        return True

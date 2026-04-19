@@ -35,6 +35,16 @@ class ConfigDetector:
                 "%USERPROFILE%/.openclaw/config.json",
             ],
         },
+        "hermes": {
+            "display_name": "Hermes",
+            "filename": "config.yaml",
+            "standard_paths": [
+                "~/.hermes/config.yaml",
+                "~/.config/hermes/config.yaml",
+                "%USERPROFILE%/.hermes/config.yaml",
+                "$HOME/.hermes/config.yaml",
+            ],
+        },
     }
 
     def __init__(self):

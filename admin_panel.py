@@ -9,6 +9,7 @@ import requests
 import os
 import json
 import base64
+import socket
 
 from config_assistant.env_detector import is_running_in_docker
 from config_assistant.config_detector import ConfigDetector
@@ -16,6 +17,7 @@ from config_assistant.backup_manager import BackupManager
 from config_assistant.injectors.claude_code import ClaudeCodeInjector
 from config_assistant.injectors.opencode import OpenCodeInjector
 from config_assistant.injectors.openclaw import OpenClawInjector
+from config_assistant.injectors.hermes import HermesInjector
 from config_assistant.ai_analyzer import AIAnalyzer
 
 # --- 数据库初始化 ---
@@ -252,6 +254,42 @@ def log_custom_usage(
             synchronize_session=False,
         )
         session.commit()
+
+
+def detect_proxy_base_url() -> tuple[str, list[str]]:
+    """推断代理可访问地址，并返回候选列表"""
+    proxy_port = (os.getenv("PROXY_PORT", "8000") or "8000").strip()
+    proxy_host = (os.getenv("PROXY_HOST", "0.0.0.0") or "0.0.0.0").strip()
+    explicit = (os.getenv("PROXY_PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+
+    if proxy_host and proxy_host not in {"0.0.0.0", "::", "127.0.0.1", "localhost"}:
+        candidates.append(f"http://{proxy_host}:{proxy_port}")
+
+    candidates.append(f"http://localhost:{proxy_port}")
+    candidates.append(f"http://127.0.0.1:{proxy_port}")
+
+    # 在局域网部署时给出一个可参考的网卡 IP
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+            if lan_ip and lan_ip not in {"127.0.0.1", "0.0.0.0"}:
+                candidates.append(f"http://{lan_ip}:{proxy_port}")
+    except Exception:
+        pass
+
+    uniq = []
+    for item in candidates:
+        normalized = (item or "").strip().rstrip("/")
+        if normalized and normalized not in uniq:
+            uniq.append(normalized)
+
+    default_base = uniq[0] if uniq else f"http://localhost:{proxy_port}"
+    return default_base, uniq
 
 # --- 页面逻辑 ---
 
@@ -681,9 +719,25 @@ elif menu == "模型映射管理":
 
 elif menu == "工具配置助手":
     st.header("🛠️ AI 工具配置助手")
-    
-    base_host = "http://localhost:8000"
+
+    detected_base_host, base_candidates = detect_proxy_base_url()
+    if "assistant_proxy_base_host" not in st.session_state:
+        st.session_state.assistant_proxy_base_host = detected_base_host
+
+    st.caption("自动配置写入的是当前服务端机器上的配置文件，无法直接改浏览器所在远端电脑的本地文件。")
+    st.caption("如果你在 Docker 或局域网给其它电脑使用，请把下方地址改成客户端可访问的代理地址。")
+
+    base_host_input = st.text_input(
+        "客户端访问代理地址（不带 /v1）",
+        value=st.session_state.assistant_proxy_base_host,
+        help="示例: http://192.168.1.10:8000 或 https://your-domain",
+    ).strip()
+    base_host = (base_host_input or detected_base_host).rstrip("/")
+    st.session_state.assistant_proxy_base_host = base_host
     proxy_url_v1 = f"{base_host}/v1"
+
+    if base_candidates:
+        st.caption("检测到的候选地址: " + " | ".join(base_candidates[:4]))
     master_key = os.getenv("MASTER_KEY", "sk-admin-123456")
     
     with SessionLocal() as session:
@@ -692,6 +746,32 @@ elif menu == "工具配置助手":
     
     model_list = sorted(set(v_models)) if v_models else ["GLM5"]
     model_hint = "GLM5" if "GLM5" in model_list else model_list[0]
+    opencode_models_dict = {m: {"name": m} for m in model_list}
+    opencode_config_data = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            "aiproxy": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "AIProxy",
+                "options": {
+                    "baseURL": proxy_url_v1,
+                    "apiKey": master_key,
+                },
+                "models": opencode_models_dict,
+            }
+        },
+    }
+    opencode_config_content = json.dumps(opencode_config_data, ensure_ascii=False, indent=2)
+    hermes_config_content = "\n".join(
+        [
+            "model:",
+            '  provider: "custom"',
+            f'  api_base: "{proxy_url_v1}"',
+            f'  api_key: "{master_key}"',
+            f'  model_name: "{model_hint}"',
+            "",
+        ]
+    )
     
     running_in_docker = is_running_in_docker()
     
@@ -785,6 +865,8 @@ elif menu == "工具配置助手":
                     tool_hints.append(f"OpenCode (注入 {len(model_list)} 个代理模型)")
                 if st.session_state.selected_tools.get("openclaw"):
                     tool_hints.append("OpenClaw")
+                if st.session_state.selected_tools.get("hermes"):
+                    tool_hints.append("Hermes")
                 if tool_hints:
                     st.info("将为以下工具执行配置：\n- " + "\n- ".join(tool_hints))
                 
@@ -834,13 +916,21 @@ elif menu == "工具配置助手":
                                     model_list=model_list,
                                     default_model=model_hint,
                                 )
+                            elif tool_id == "hermes":
+                                injector = HermesInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
                             
                             if injector:
                                 ok, err = injector.inject()
                                 if ok:
                                     save_ok, save_err = injector.save_config()
                                     if save_ok:
-                                        if backup_manager.validate_json(config_path):
+                                        if backup_manager.validate_config_file(config_path):
                                             success_count += 1
                                             messages.append(f"✅ [{result['display_name']}] 配置写入成功")
                                             messages.append(injector.generate_description())
@@ -905,6 +995,14 @@ elif menu == "工具配置助手":
                                     model_list=model_list,
                                     default_model=model_hint,
                                 )
+                            elif tool_id == "hermes":
+                                injector = HermesInjector(
+                                    config_path=config_path,
+                                    proxy_base_url=base_host,
+                                    proxy_api_key=master_key,
+                                    model_list=model_list,
+                                    default_model=model_hint,
+                                )
                             
                             if injector:
                                 injector.inject()
@@ -924,23 +1022,6 @@ elif menu == "工具配置助手":
         st.divider()
         st.subheader("📋 手动配置")
         st.info("高级用户可以使用手动配置方式，生成配置示例和启动脚本。")
-    
-        opencode_models_dict = {m: {"name": m} for m in model_list}
-        opencode_config_data = {
-            "$schema": "https://opencode.ai/config.json",
-            "provider": {
-                "aiproxy": {
-                    "npm": "@ai-sdk/openai-compatible",
-                    "name": "AIProxy",
-                    "options": {
-                        "baseURL": proxy_url_v1,
-                        "apiKey": master_key,
-                    },
-                    "models": opencode_models_dict,
-                }
-            },
-        }
-        opencode_config_content = json.dumps(opencode_config_data, ensure_ascii=False, indent=2)
 
     t1, t2, t3, t4 = st.tabs(["Claude Code", "OpenCode", "Cursor / Trae", "Other Tools"])
     
@@ -1139,6 +1220,15 @@ elif menu == "工具配置助手":
         - **支持模型**: `{", ".join(v_models) if v_models else "尚未配置"}`
         """)
         st.caption("说明：上游平台的真实 API Key 来自「API Key 管理」，代理会自动按模型映射与供应商配置转发。")
+
+        st.markdown("---")
+        st.subheader("Hermes 配置示例")
+        st.caption("Hermes 建议在 `~/.hermes/config.yaml` 中写入 custom provider 配置。")
+        if st.button("生成 Hermes 配置示例 (hermes_config.yaml)"):
+            with open("hermes_config.yaml", "w", encoding="utf-8") as f:
+                f.write(hermes_config_content)
+            st.success("配置示例已生成：`hermes_config.yaml`")
+        st.code(hermes_config_content, language="yaml")
         
         st.button("📋 复制全部配置信息", on_click=lambda: st.write("信息已复制到剪贴板 (模拟行为)"))
 
