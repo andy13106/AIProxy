@@ -10,26 +10,25 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
+from sqlalchemy.pool import NullPool
+
 # SQLite 异步连接 URL (相对路径)
 DATABASE_URL = f"sqlite+aiosqlite:///./data/proxy.db"
 # 同步连接用于 Streamlit
 SYNC_DATABASE_URL = f"sqlite:///./data/proxy.db"
 
+# SQLite 不支持连接池，使用 NullPool
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
+    poolclass=NullPool,
 )
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 sync_engine = create_engine(
     SYNC_DATABASE_URL,
     echo=False,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
+    poolclass=NullPool,
 )
 SessionLocal = sessionmaker(sync_engine, expire_on_commit=False)
 

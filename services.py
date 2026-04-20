@@ -186,7 +186,7 @@ def build_completion_params(
         if body.get("tool_choice") is not None:
             completion_kwargs["tool_choice"] = body.get("tool_choice")
 
-    return completion_kwargs
+    return completion_kwargs, clean_real_model, messages
 
 
 async def log_usage(key_id: int, model_name: str, response_data: Any, is_image: bool = False) -> None:

@@ -178,6 +178,12 @@ async def anthropic_proxy(request: Request, x_api_key: Optional[str] = Header(No
 async def handle_completion(body: dict, is_anthropic: bool = False):
     """处理完成请求"""
     model_name = body.get("model")
+    
+    # 检查模型名是否为空
+    if not model_name:
+        logger.error("Request missing model name")
+        raise HTTPException(status_code=400, detail="Missing required field: model")
+    
     stream = body.get("stream", False)
 
     logger.debug(f"Request for model: {model_name}, stream: {stream}, is_anthropic: {is_anthropic}")
@@ -194,64 +200,22 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
 
         for api_key in keys:
             try:
-                messages = body.get("messages") or []
+                # 使用 services.py 中的统一函数构建参数
                 tools = body.get("tools") or []
-
-                if is_anthropic:
-                    messages = convert_anthropic_messages_to_openai(messages)
-                    system_prompt = extract_text_from_content_blocks(body.get("system", ""))
-                    if system_prompt:
-                        messages = [{"role": "system", "content": system_prompt}] + messages
-
-                clean_api_key = clean_config_value(api_key.key)
-                clean_api_base = clean_config_value(provider.api_base)
-                clean_real_model = clean_config_value(mapping.real_name)
-
-                extra_body = body.get("extra_body") or {}
                 request_stream = stream
 
                 # Anthropic 工具调用的流式事件结构与 OpenAI 差异较大，先走非流式上游再转换回 SSE
                 if is_anthropic and tools:
                     request_stream = False
 
-                if request_stream:
-                    extra_body = dict(extra_body)
-                    stream_options = dict(extra_body.get("stream_options") or {})
-                    stream_options["include_usage"] = True
-                    extra_body["stream_options"] = stream_options
-
-                completion_kwargs = {
-                    "model": clean_real_model,
-                    "messages": messages,
-                    "api_key": clean_api_key,
-                    "api_base": clean_api_base,
-                    "custom_llm_provider": "openai",
-                    "stream": request_stream,
-                    "max_tokens": body.get("max_tokens", 4096),
-                    "temperature": body.get("temperature", 0.7),
-                    "extra_body": extra_body,
-                    "timeout": body.get("timeout", settings.upstream_timeout_sec),
-                }
-
-                if body.get("top_p") is not None:
-                    completion_kwargs["top_p"] = body.get("top_p")
-                if body.get("stop_sequences"):
-                    completion_kwargs["stop"] = body.get("stop_sequences")
-                elif body.get("stop"):
-                    completion_kwargs["stop"] = body.get("stop")
-
-                # 工具调用参数
-                if is_anthropic and tools:
-                    converted_tools = convert_anthropic_tools_to_openai(tools)
-                    if converted_tools:
-                        completion_kwargs["tools"] = converted_tools
-                    converted_tool_choice = convert_anthropic_tool_choice(body.get("tool_choice"))
-                    if converted_tool_choice:
-                        completion_kwargs["tool_choice"] = converted_tool_choice
-                elif not is_anthropic and body.get("tools"):
-                    completion_kwargs["tools"] = body.get("tools")
-                    if body.get("tool_choice") is not None:
-                        completion_kwargs["tool_choice"] = body.get("tool_choice")
+                completion_kwargs, clean_real_model, messages = build_completion_params(
+                    body=body,
+                    mapping=mapping,
+                    provider=provider,
+                    api_key=api_key,
+                    is_anthropic=is_anthropic,
+                    request_stream=request_stream,
+                )
 
                 # 处理 Anthropic 工具调用的流式响应
                 if stream and is_anthropic and not request_stream:
