@@ -169,7 +169,7 @@ class AnthropicToolStreamGenerator:
 
     def __init__(
         self,
-        completion_kwargs: dict,
+        final_response: Any,
         model_name: str,
         clean_real_model: str,
         messages: list,
@@ -177,7 +177,7 @@ class AnthropicToolStreamGenerator:
         log_usage_callback: Callable,
         heartbeat_sec: float = 15.0,
     ):
-        self.completion_kwargs = completion_kwargs
+        self.final_response = final_response
         self.model_name = model_name
         self.clean_real_model = clean_real_model
         self.messages = messages
@@ -190,27 +190,8 @@ class AnthropicToolStreamGenerator:
 
     async def generate(self) -> AsyncGenerator[str, None]:
         """生成流式响应"""
-        import litellm
-
         try:
-            pending_response = asyncio.create_task(litellm.acompletion(**self.completion_kwargs))
-
-            # 使用 wait_for 替代循环检查，避免竞态条件
-            while True:
-                try:
-                    done, _ = await asyncio.wait(
-                        {pending_response},
-                        timeout=self.heartbeat_sec
-                    )
-                    if pending_response in done:
-                        break
-                    # 超时，发送心跳
-                    yield ": ping\n\n"
-                except asyncio.CancelledError:
-                    raise
-
-            final_response = pending_response.result()
-            anthropic_message = convert_openai_response_to_anthropic(final_response, self.model_name)
+            anthropic_message = convert_openai_response_to_anthropic(self.final_response, self.model_name)
             usage = anthropic_message.get("usage", {})
 
             yield sse_event(

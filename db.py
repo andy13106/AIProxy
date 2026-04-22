@@ -3,6 +3,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
 import datetime
 import os
+import sqlite3
 
 # 确保数据目录存在 (使用相对路径)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10,12 +11,45 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
+DB_FILE_PATH = os.path.join(DATA_DIR, "proxy.db")
+
+
+def ensure_sqlite_schema() -> None:
+    """轻量 SQLite 迁移：补齐新增列/表，避免旧库启动时报错。"""
+    conn = sqlite3.connect(DB_FILE_PATH)
+    try:
+        cur = conn.cursor()
+
+        # model_mappings.order 列
+        cur.execute("PRAGMA table_info(model_mappings)")
+        model_mapping_cols = {row[1] for row in cur.fetchall()}
+        if model_mapping_cols and "order" not in model_mapping_cols:
+            cur.execute('ALTER TABLE model_mappings ADD COLUMN "order" INTEGER DEFAULT 0')
+
+        # tool_default_models 表
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_default_models (
+                id INTEGER PRIMARY KEY,
+                tool_id VARCHAR(50) UNIQUE NOT NULL,
+                default_model VARCHAR(100) NOT NULL,
+                updated_at DATETIME
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+ensure_sqlite_schema()
+
 from sqlalchemy.pool import NullPool
 
-# SQLite 异步连接 URL (相对路径)
-DATABASE_URL = f"sqlite+aiosqlite:///./data/proxy.db"
-# 同步连接用于 Streamlit
-SYNC_DATABASE_URL = f"sqlite:///./data/proxy.db"
+# SQLite 异步连接 URL（绝对路径，避免不同启动目录导致连接到不同 DB 文件）
+DATABASE_URL = f"sqlite+aiosqlite:///{DB_FILE_PATH}"
+# 同步连接用于 Streamlit（同样使用绝对路径）
+SYNC_DATABASE_URL = f"sqlite:///{DB_FILE_PATH}"
 
 # SQLite 不支持连接池，使用 NullPool
 engine = create_async_engine(
@@ -53,8 +87,9 @@ class ModelMapping(Base):
     __tablename__ = "model_mappings"
     id = Column(Integer, primary_key=True)
     virtual_name = Column(String(100), unique=True, nullable=False)  # 工具看到的模型名，如 "gpt-4"
-    real_name = Column(String(100), nullable=False)     # 真实的模型名，如 "meta/llama-3.1-405b-instruct"
+    real_name = Column(String(100), nullable=False)  # 真实的模型名，如 "meta/llama-3.1-405b-instruct"
     provider_id = Column(Integer, ForeignKey("providers.id"))
+    order = Column(Integer, default=0)  # 排序序号，数值越小越靠前
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -66,6 +101,15 @@ class UsageLog(Base):
     total_tokens = Column(Integer, default=0)
     images_count = Column(Integer, default=0)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class ToolDefaultModel(Base):
+    """存储各个 AI 工具的默认模型配置"""
+    __tablename__ = "tool_default_models"
+    id = Column(Integer, primary_key=True)
+    tool_id = Column(String(50), unique=True, nullable=False)  # 工具 ID，如 "claude_code", "opencode" 等
+    default_model = Column(String(100), nullable=False)  # 默认模型名称
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
 async def init_db():
     async with engine.begin() as conn:

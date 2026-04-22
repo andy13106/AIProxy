@@ -32,7 +32,23 @@ from services import (
 from streaming import AnthropicToolStreamGenerator, StreamGenerator
 
 app = FastAPI(title="AI Proxy Gateway")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
+
+
+def _resolve_timeout_value(request_value: object, default_value: float) -> float:
+    """解析并约束超时参数，避免客户端把服务端默认超时压得过低。"""
+    try:
+        requested = float(request_value)
+    except (TypeError, ValueError):
+        return float(default_value)
+
+    if requested <= 0:
+        return float(default_value)
+
+    if settings.allow_client_timeout_override:
+        return requested
+
+    return max(float(default_value), requested)
 
 
 @app.middleware("http")
@@ -85,6 +101,8 @@ async def verify_auth(credentials: HTTPAuthorizationCredentials = Security(secur
     """验证认证"""
     if not settings.auth_enabled:
         return True
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
     if credentials.credentials != settings.master_key:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return True
@@ -111,12 +129,13 @@ def _require_api_key_for_models(request: Request) -> None:
 @app.get("/v1/models")
 @app.get("/models")
 @app.get("/v1/v1/models")
+@app.get("/api/v1/models")
 async def list_proxy_models(request: Request):
     """OpenAI 兼容模型列表接口，返回已映射的虚拟模型名"""
     _require_api_key_for_models(request)
 
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(ModelMapping.virtual_name).order_by(ModelMapping.virtual_name.asc()))
+        result = await session.execute(select(ModelMapping.virtual_name).order_by(ModelMapping.order, ModelMapping.id))
         names = [row[0] for row in result.all() if row and row[0]]
 
     uniq_names = []
@@ -140,6 +159,25 @@ async def list_proxy_models(request: Request):
     }
 
 
+@app.get("/v1/models/{model_id}")
+async def get_proxy_model(model_id: str, request: Request):
+    """OpenAI 兼容单模型信息接口"""
+    _require_api_key_for_models(request)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ModelMapping.virtual_name).where(ModelMapping.virtual_name == model_id)
+        )
+        row = result.first()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Model {model_id} not mapped.")
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "aiproxy",
+    }
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_proxy(request: Request, auth=Depends(verify_auth)):
@@ -147,6 +185,47 @@ async def chat_proxy(request: Request, auth=Depends(verify_auth)):
     body = await request.json()
     logger.debug(f"/v1/chat/completions request - Model: {body.get('model')}, Stream: {body.get('stream', False)}")
     return await handle_completion(body, is_anthropic=False)
+
+
+@app.post("/v1/messages/count_tokens")
+@app.post("/messages/count_tokens")
+async def anthropic_count_tokens(request: Request, x_api_key: Optional[str] = Header(None, alias="x-api-key")):
+    """Anthropic token 计数接口（估算）"""
+    auth_header = request.headers.get("Authorization")
+    api_key = x_api_key
+    if auth_header and auth_header.lower().startswith("bearer "):
+        api_key = auth_header.split(" ", 1)[1].strip()
+
+    if settings.auth_enabled:
+        if not api_key or api_key != settings.master_key:
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"type": "authentication_error", "message": "Invalid API Key"}},
+            )
+
+    body = await request.json()
+    messages = body.get("messages", [])
+    system_text = body.get("system", "")
+    if isinstance(system_text, list):
+        system_text = " ".join(
+            block.get("text", "") for block in system_text if isinstance(block, dict)
+        )
+
+    total_chars = len(system_text or "")
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+        else:
+            total_chars += len(str(content))
+
+    # 粗略估算：约 4 字符 = 1 token（英文为主），中文约 1.5 字符 = 1 token
+    # 取中间值约 3 字符 = 1 token
+    estimated_tokens = max(1, total_chars // 3)
+
+    return {"id": f"ct_{uuid.uuid4().hex[:12]}", "type": "token_count", "token_count": estimated_tokens}
 
 
 @app.post("/v1/messages")
@@ -157,8 +236,8 @@ async def anthropic_proxy(request: Request, x_api_key: Optional[str] = Header(No
     auth_header = request.headers.get("Authorization")
     api_key = x_api_key
 
-    if auth_header and auth_header.startswith("Bearer "):
-        api_key = auth_header.split(" ")[1]
+    if auth_header and auth_header.lower().startswith("bearer "):
+        api_key = auth_header.split(" ", 1)[1].strip()
 
     logger.debug(f"Auth attempt with key: {mask_secret(api_key)}")
 
@@ -185,8 +264,17 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
         raise HTTPException(status_code=400, detail="Missing required field: model")
     
     stream = body.get("stream", False)
+    per_key_timeout = _resolve_timeout_value(body.get("timeout"), settings.upstream_timeout_sec)
+    total_timeout = _resolve_timeout_value(
+        body.get("proxy_total_timeout"),
+        settings.request_total_timeout_sec,
+    )
+    total_deadline = time.monotonic() + max(1.0, total_timeout)
 
-    logger.debug(f"Request for model: {model_name}, stream: {stream}, is_anthropic: {is_anthropic}")
+    logger.debug(
+        f"Request for model: {model_name}, stream: {stream}, is_anthropic: {is_anthropic}, "
+        f"per_key_timeout={per_key_timeout}, total_timeout={total_timeout}"
+    )
 
     async with AsyncSessionLocal() as session:
         # 获取模型映射
@@ -197,8 +285,14 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
 
         last_error = ""
         had_rate_limit_error = False
+        had_transient_network_error = False
+        hit_total_timeout = False
 
         for api_key in keys:
+            remaining = total_deadline - time.monotonic()
+            if remaining <= 0:
+                hit_total_timeout = True
+                break
             try:
                 # 使用 services.py 中的统一函数构建参数
                 tools = body.get("tools") or []
@@ -216,12 +310,19 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                     is_anthropic=is_anthropic,
                     request_stream=request_stream,
                 )
+                completion_kwargs["timeout"] = max(1.0, min(per_key_timeout, remaining))
+                completion_kwargs["num_retries"] = max(0, int(settings.upstream_max_retries))
+                logger.debug(
+                    f"Trying provider={provider.name}, key_id={api_key.id}, model={clean_real_model}, "
+                    f"timeout={completion_kwargs['timeout']:.2f}, remaining={remaining:.2f}"
+                )
 
                 # 处理 Anthropic 工具调用的流式响应
                 if stream and is_anthropic and not request_stream:
+                    response = await litellm.acompletion(**completion_kwargs)
                     await clear_key_failure(session, api_key.id)
                     generator = AnthropicToolStreamGenerator(
-                        completion_kwargs=completion_kwargs,
+                        final_response=response,
                         model_name=model_name,
                         clean_real_model=clean_real_model,
                         messages=messages,
@@ -274,10 +375,7 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 return response
 
             except Exception as e:
-                import traceback
-
                 logger.error(f"Key {api_key.id} failed: {e}")
-                traceback.print_exc()
                 last_error = str(e)
                 error_text = str(e).lower()
                 if "ratelimiterror" in error_text or "error code: 429" in error_text or "'status': 429" in error_text:
@@ -286,14 +384,44 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                         await mark_key_rate_limited(session, api_key.id)
                     except Exception as mark_err:
                         logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
+                elif any(
+                    token in error_text
+                    for token in [
+                        "connection error",
+                        "server disconnected",
+                        "readerror",
+                        "read timeout",
+                        "timed out",
+                        "sockettimeouterror",
+                        "apitimeouterror",
+                    ]
+                ):
+                    had_transient_network_error = True
+                    try:
+                        await mark_key_rate_limited(session, api_key.id)
+                    except Exception as mark_err:
+                        logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
                 continue
 
+        if hit_total_timeout:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"Proxy total timeout reached ({int(total_timeout)}s). "
+                    f"Last upstream error: {last_error or 'N/A'}"
+                ),
+            )
         if had_rate_limit_error:
             retry_after = max(1, int(settings.key_rate_limit_cooldown_sec))
             raise HTTPException(
                 status_code=429,
                 detail="Upstream rate limited. Please retry later.",
                 headers={"Retry-After": str(retry_after)},
+            )
+        if had_transient_network_error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Upstream network unstable. Last error: {last_error}",
             )
         raise HTTPException(status_code=502, detail=f"All upstream keys failed. Last error: {last_error}")
 
@@ -306,3 +434,70 @@ async def image_proxy(request: Request, auth=Depends(verify_auth)):
 
     body = await request.json()
     return await execute_image_generation(body)
+
+
+# --- 兼容性端点：避免 AI 工具探测时返回 404 ---
+
+@app.get("/props")
+@app.get("/v1/props")
+async def props_endpoint():
+    """兼容 Ollama 等工具的属性探测端点"""
+    return {"status": "ok", "service": "AI Proxy Gateway"}
+
+
+@app.get("/version")
+async def version_endpoint():
+    """兼容 Ollama 等工具的版本探测端点"""
+    return {"version": "1.0.0"}
+
+
+@app.get("/api/tags")
+async def ollama_tags_endpoint():
+    """兼容 Ollama 客户端的模型列表端点"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ModelMapping.virtual_name).order_by(ModelMapping.order, ModelMapping.id))
+        names = [row[0] for row in result.all() if row and row[0]]
+        uniq_names = []
+        seen = set()
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                uniq_names.append(name)
+        return {
+            "models": [
+                {
+                    "name": name,
+                    "model": name,
+                    "modified_at": "",
+                    "size": 0,
+                }
+                for name in uniq_names
+            ]
+        }
+
+
+@app.post("/api/show")
+async def ollama_show_endpoint(request: Request):
+    """兼容 Ollama 客户端的模型详情探测接口"""
+    body = await request.json()
+    model_name = body.get("name") or body.get("model")
+    if not model_name:
+        raise HTTPException(status_code=400, detail="Missing required field: name")
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ModelMapping.virtual_name, ModelMapping.real_name).where(ModelMapping.virtual_name == model_name)
+        )
+        row = result.first()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Model {model_name} not mapped.")
+        virtual_name, real_name = row
+
+    return {
+        "license": "unknown",
+        "modelfile": f"FROM {real_name}",
+        "parameters": "",
+        "template": "",
+        "details": {"family": "openai-compatible", "format": "proxy", "parameter_size": "unknown"},
+        "model_info": {"virtual_name": virtual_name, "real_name": real_name},
+    }

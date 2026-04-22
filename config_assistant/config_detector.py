@@ -18,10 +18,12 @@ class ConfigDetector:
         },
         "opencode": {
             "display_name": "OpenCode",
-            "filename": "config.json",
+            "filename": "opencode.json",
             "standard_paths": [
-                "~/.opencode/config.json",
+                "~/.config/opencode/opencode.json",
+                "~/.config/opencode/opencode.jsonc",
                 "~/.config/opencode/config.json",
+                "~/.opencode/config.json",
                 "%USERPROFILE%/.opencode/config.json",
                 "$HOME/.opencode/config.json",
             ],
@@ -60,6 +62,17 @@ class ConfigDetector:
         if tool_id not in self.TOOL_CONFIGS:
             return None
 
+        # OpenCode 支持通过 OPENCODE_CONFIG 指定自定义配置文件路径
+        if tool_id == "opencode":
+            custom_path = (os.getenv("OPENCODE_CONFIG", "") or "").strip()
+            if custom_path:
+                try:
+                    actual_custom_path = self._resolve_path(custom_path)
+                    if actual_custom_path.exists() and actual_custom_path.is_file():
+                        return str(actual_custom_path.absolute())
+                except Exception:
+                    pass
+
         config = self.TOOL_CONFIGS[tool_id]
         for path_pattern in config["standard_paths"]:
             try:
@@ -87,6 +100,12 @@ class ConfigDetector:
         """获取工具的标准配置路径（即使不存在）"""
         if tool_id not in self.TOOL_CONFIGS:
             return ""
+
+        if tool_id == "opencode":
+            custom_path = (os.getenv("OPENCODE_CONFIG", "") or "").strip()
+            if custom_path:
+                return str(self._resolve_path(custom_path))
+
         config = self.TOOL_CONFIGS[tool_id]
         return str(self._resolve_path(config["standard_paths"][0]))
 

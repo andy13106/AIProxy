@@ -38,10 +38,15 @@ def start_services() -> None:
         os.getenv("PROXY_PORT", "8000"),
         "--no-use-colors",
     ]
+    proxy_workers = int(os.getenv("PROXY_WORKERS", "1") or "1")
+    if proxy_workers > 1:
+        backend_cmd.extend(["--workers", str(proxy_workers)])
     print(
         "API backend: "
         f"http://{os.getenv('PROXY_HOST', '0.0.0.0')}:{os.getenv('PROXY_PORT', '8000')}"
     )
+    if proxy_workers > 1:
+        print(f"API backend workers: {proxy_workers}")
     backend_process = subprocess.Popen(backend_cmd)
 
     admin_host = os.getenv("ADMIN_HOST", "0.0.0.0")

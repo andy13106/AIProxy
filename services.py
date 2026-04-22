@@ -1,6 +1,8 @@
 """业务逻辑模块"""
 
 import datetime
+import threading
+from collections import defaultdict
 from typing import Any, Optional
 
 import litellm
@@ -17,6 +19,27 @@ from converters import (
     extract_usage,
 )
 from db import APIKey, AsyncSessionLocal, ModelMapping, Provider
+
+_provider_key_cursor_lock = threading.Lock()
+_provider_key_cursor = defaultdict(int)
+
+
+def _order_keys_for_provider(provider_id: int, keys: list) -> list:
+    """根据策略返回 key 顺序：
+    - sticky_failover: 固定顺序主 key 优先，失败再切换
+    - round_robin: 请求级轮询起点
+    """
+    if not keys:
+        return keys
+    ordered = sorted(keys, key=lambda k: k.id)
+    if len(ordered) == 1:
+        return ordered
+    if settings.key_strategy != "round_robin":
+        return ordered
+    with _provider_key_cursor_lock:
+        start_idx = _provider_key_cursor[provider_id] % len(ordered)
+        _provider_key_cursor[provider_id] = (start_idx + 1) % len(ordered)
+    return ordered[start_idx:] + ordered[:start_idx]
 
 
 async def get_model_mapping(session: Any, model_name: str, is_anthropic: bool) -> tuple:
@@ -69,7 +92,7 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
 
     cooldown_sec = max(0.0, settings.key_rate_limit_cooldown_sec)
     if cooldown_sec <= 0:
-        return keys
+        return _order_keys_for_provider(provider_id, keys)
 
     now = datetime.datetime.utcnow()
     eligible_keys = []
@@ -89,7 +112,7 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
                 earliest_available_in = remaining
 
     if eligible_keys:
-        return eligible_keys
+        return _order_keys_for_provider(provider_id, eligible_keys)
 
     retry_after = max(1, int(earliest_available_in or cooldown_sec))
     raise HTTPException(
@@ -236,12 +259,7 @@ async def execute_image_generation(body: dict) -> dict:
             raise HTTPException(status_code=404, detail=f"Image model {model_name} not mapped.")
 
         mapping, provider = mapping_data
-        stmt = select(APIKey).where(APIKey.provider_id == provider.id, APIKey.is_active.is_(True))
-        result = await session.execute(stmt)
-        keys = result.scalars().all()
-
-        if not keys:
-            raise HTTPException(status_code=503, detail="No active keys for image generation.")
+        keys = await get_active_keys(session, provider.id)
 
         for api_key in keys:
             try:
@@ -254,10 +272,33 @@ async def execute_image_generation(body: dict) -> dict:
                     size=body.get("size", "1024x1024"),
                     timeout=body.get("timeout", settings.upstream_timeout_sec),
                 )
+                await clear_key_failure(session, api_key.id)
                 await log_usage(api_key.id, model_name, response, is_image=True)
                 return response
             except Exception as e:
                 logger.error(f"Key {api_key.id} failed for image generation: {e}")
+                error_text = str(e).lower()
+                if "ratelimiterror" in error_text or "error code: 429" in error_text or "'status': 429" in error_text:
+                    try:
+                        await mark_key_rate_limited(session, api_key.id)
+                    except Exception as mark_err:
+                        logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
+                elif any(
+                    token in error_text
+                    for token in [
+                        "connection error",
+                        "server disconnected",
+                        "readerror",
+                        "read timeout",
+                        "timed out",
+                        "sockettimeouterror",
+                        "apitimeouterror",
+                    ]
+                ):
+                    try:
+                        await mark_key_rate_limited(session, api_key.id)
+                    except Exception as mark_err:
+                        logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
                 continue
 
         raise HTTPException(status_code=502, detail="All upstream keys failed for image generation.")

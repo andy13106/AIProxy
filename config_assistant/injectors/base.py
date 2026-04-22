@@ -28,8 +28,16 @@ class BaseInjector(ABC):
         """加载现有配置文件"""
         try:
             if self.config_path.exists():
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    self.original_config = json.load(f)
+                with open(self.config_path, "r", encoding="utf-8", errors="replace") as f:
+                    raw_text = f.read()
+                try:
+                    self.original_config = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    # 尝试容错清洗（如非法字符、注释、尾逗号）后再解析
+                    repaired = self._try_repair_json(raw_text)
+                    if repaired is None:
+                        return False
+                    self.original_config = repaired
             else:
                 self.original_config = {}
             # 必须深拷贝，否则修改 modified_config 时会污染 original_config，
@@ -38,6 +46,52 @@ class BaseInjector(ABC):
             return True
         except (json.JSONDecodeError, UnicodeDecodeError, IOError):
             return False
+
+    def _sanitize_json_text(self, text: str) -> str:
+        """尽量清洗掉 JSON 外层的脏字符，不改变字符串内部内容。"""
+        if not text:
+            return text
+        text = text.lstrip("\ufeff")
+
+        cleaned_chars = []
+        in_string = False
+        escaped = False
+        for ch in text:
+            if in_string:
+                cleaned_chars.append(ch)
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                cleaned_chars.append(ch)
+                continue
+
+            code = ord(ch)
+            # JSON 外层保留常见 ASCII 语法字符与空白
+            if code < 32 and ch not in ("\n", "\r", "\t"):
+                continue
+            if code > 126 and not ch.isspace():
+                continue
+            cleaned_chars.append(ch)
+
+        cleaned = "".join(cleaned_chars)
+        # 去除尾逗号
+        cleaned = cleaned.replace(",\n}", "\n}")
+        cleaned = cleaned.replace(",\n]", "\n]")
+        return cleaned
+
+    def _try_repair_json(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        """尝试把非标准 JSON 修复为可解析对象。"""
+        try:
+            return json.loads(self._sanitize_json_text(raw_text))
+        except Exception:
+            return None
 
     def save_config(self) -> Tuple[bool, str]:
         """保存修改后的配置

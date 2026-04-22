@@ -22,10 +22,18 @@ class Settings:
 
     # 超时配置
     upstream_timeout_sec: float = field(default_factory=lambda: float(os.getenv("UPSTREAM_TIMEOUT_SEC", "180")))
+    request_total_timeout_sec: float = field(
+        default_factory=lambda: float(os.getenv("REQUEST_TOTAL_TIMEOUT_SEC", "240"))
+    )
+    allow_client_timeout_override: bool = field(
+        default_factory=lambda: os.getenv("ALLOW_CLIENT_TIMEOUT_OVERRIDE", "false").lower() == "true"
+    )
+    upstream_max_retries: int = field(default_factory=lambda: int(os.getenv("UPSTREAM_MAX_RETRIES", "0")))
     stream_heartbeat_sec: float = field(default_factory=lambda: float(os.getenv("STREAM_HEARTBEAT_SEC", "15")))
     key_rate_limit_cooldown_sec: float = field(
         default_factory=lambda: float(os.getenv("KEY_RATE_LIMIT_COOLDOWN_SEC", "30"))
     )
+    key_strategy: str = field(default_factory=lambda: os.getenv("KEY_STRATEGY", "sticky_failover").lower())
 
     # Fallback 模型配置
     anthropic_fallback_virtual_model: str = field(

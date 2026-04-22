@@ -1,0 +1,30 @@
+{
+  "provider": {
+    "aiproxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "AIProxy",
+      "options": {
+        "baseURL": "http://0.0.0.0:8000/v1",
+        "apiKey": "sk-admin-123456"
+      },
+      "models": {
+        "GLM5.1": {
+          "name": "GLM5.1"ß
+        },
+        "Gemma4": {
+          "name": "Gemma4"
+        },
+        "Kimi2.5": {
+          "name": "Kimi2.5"
+        },
+        "Minimax2.7": {
+          "name": "Minimax2.7"
+        },
+        "QWen3.5": {
+          "name": "QWen3.5"
+        }
+      }
+    }
+  },
+  "$schema": "https://opencode.ai/config.json"
+}

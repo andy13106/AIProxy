@@ -2,7 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import Session
-from db import SessionLocal, sync_engine, Provider, APIKey, ModelMapping, UsageLog, Base
+from db import SessionLocal, sync_engine, Provider, APIKey, ModelMapping, UsageLog, Base, ToolDefaultModel
 import pandas as pd
 import datetime
 import requests
@@ -10,6 +10,11 @@ import os
 import json
 import base64
 import socket
+try:
+    from streamlit_sortables import sort_items
+    HAS_SORTABLES = True
+except Exception:
+    HAS_SORTABLES = False
 
 from config_assistant.env_detector import is_running_in_docker
 from config_assistant.config_detector import ConfigDetector
@@ -64,6 +69,67 @@ def delete_item(model_class, item_id, success_msg):
             session.rollback()
             st.error(f"删除失败: {e}")
             return False
+
+
+def get_ordered_model_mappings():
+    """读取并规范化模型映射顺序（1..N 连续），返回 (ModelMapping, Provider) 列表。"""
+    with SessionLocal() as session:
+        mappings = (
+            session.query(ModelMapping, Provider)
+            .join(Provider)
+            .order_by(ModelMapping.order, ModelMapping.id)
+            .all()
+        )
+        changed = False
+        for idx, (m, _) in enumerate(mappings, start=1):
+            if m.order != idx:
+                m.order = idx
+                changed = True
+        if changed:
+            session.commit()
+            mappings = (
+                session.query(ModelMapping, Provider)
+                .join(Provider)
+                .order_by(ModelMapping.order, ModelMapping.id)
+                .all()
+            )
+        return mappings
+
+
+def move_model_mapping(model_id: int, direction: str) -> bool:
+    """上移/下移某个模型映射。direction: up | down"""
+    with SessionLocal() as session:
+        mappings = session.query(ModelMapping).order_by(ModelMapping.order, ModelMapping.id).all()
+        ids = [m.id for m in mappings]
+        if model_id not in ids:
+            return False
+
+        idx = ids.index(model_id)
+        target_idx = idx - 1 if direction == "up" else idx + 1
+        if target_idx < 0 or target_idx >= len(mappings):
+            return False
+
+        current = mappings[idx]
+        target = mappings[target_idx]
+        current.order, target.order = target.order, current.order
+        session.commit()
+        return True
+
+
+def apply_model_order(ordered_ids: list[int]) -> bool:
+    """按给定 ID 顺序更新模型映射 order。"""
+    if not ordered_ids:
+        return False
+    with SessionLocal() as session:
+        models = session.query(ModelMapping).filter(ModelMapping.id.in_(ordered_ids)).all()
+        by_id = {m.id: m for m in models}
+        for idx, model_id in enumerate(ordered_ids, start=1):
+            model = by_id.get(model_id)
+            if model is not None:
+                model.order = idx
+        session.commit()
+    return True
+
 
 def upsert_env_value(key: str, value: str, env_path: str = ".env") -> None:
     """更新 .env 中的某个 key（不存在则追加）"""
@@ -138,7 +204,15 @@ def fetch_models(api_base, api_key):
                         models.append(m)
                 return models
             elif isinstance(data, list):
-                return [m.get("id", m) for m in data]
+                models = []
+                for m in data:
+                    if isinstance(m, dict):
+                        model_id = m.get("id") or m.get("model") or m.get("name")
+                        if model_id:
+                            models.append(model_id)
+                    elif isinstance(m, str):
+                        models.append(m)
+                return models
         return []
     except Exception as e:
         return []
@@ -325,6 +399,13 @@ if menu == "使用概览":
             UsageLog.timestamp <= today_end
         ).group_by(UsageLog.model_name).order_by(func.sum(UsageLog.total_tokens).desc()).all()
 
+        all_time_summary = session.query(
+            UsageLog.model_name,
+            func.count(UsageLog.id).label("request_count"),
+            func.sum(UsageLog.total_tokens).label("total_tokens"),
+            func.sum(UsageLog.images_count).label("images_count"),
+        ).group_by(UsageLog.model_name).order_by(func.sum(UsageLog.total_tokens).desc()).all()
+
     if today_summary:
         total_requests_today = sum(row.request_count or 0 for row in today_summary)
         total_tokens_today = sum(row.total_tokens or 0 for row in today_summary)
@@ -345,12 +426,25 @@ if menu == "使用概览":
             "图片数": row.images_count or 0,
         } for row in today_summary])
         st.dataframe(summary_df, width="stretch", hide_index=True)
-        st.caption("可按模型清理统计数据（仅删除 usage_logs，不影响模型映射）。")
-        for row in today_summary:
+    else:
+        st.info("今天还没有有效使用记录。")
+
+    st.subheader("模型数据清理（全历史）")
+    st.caption("这里列出所有历史出现过的模型（不仅是今天），可删除任意模型统计数据。")
+    if all_time_summary:
+        cleanup_df = pd.DataFrame([{
+            "模型": row.model_name,
+            "历史请求次数": row.request_count or 0,
+            "历史总 Tokens": row.total_tokens or 0,
+            "历史图片数": row.images_count or 0,
+        } for row in all_time_summary])
+        st.dataframe(cleanup_df, width="stretch", hide_index=True)
+
+        for row in all_time_summary:
             c_view, c_del = st.columns([3, 1])
-            if c_view.button(f"查看 {row.model_name}", key=f"usage_model_{row.model_name}"):
+            if c_view.button(f"查看 {row.model_name}", key=f"usage_model_all_{row.model_name}"):
                 st.session_state.usage_selected_model = row.model_name
-            if c_del.button(f"删除 {row.model_name}", key=f"usage_delete_model_{row.model_name}"):
+            if c_del.button(f"删除 {row.model_name}", key=f"usage_delete_all_{row.model_name}"):
                 with SessionLocal() as session:
                     deleted = session.query(UsageLog).filter(UsageLog.model_name == row.model_name).delete()
                     session.commit()
@@ -358,9 +452,8 @@ if menu == "使用概览":
                     st.session_state.usage_selected_model = None
                 st.toast(f"已删除模型 {row.model_name} 的 {deleted} 条统计记录", icon="🧹")
                 st.rerun()
-
     else:
-        st.info("今天还没有有效使用记录。")
+        st.info("暂无可清理的历史模型数据。")
 
     st.divider()
     st.subheader("明细查询")
@@ -685,7 +778,13 @@ elif menu == "模型映射管理":
                             if session.query(ModelMapping).filter(ModelMapping.virtual_name == v_name).first():
                                 st.error(f"虚拟名称 '{v_name}' 已占用")
                             else:
-                                new_m = ModelMapping(virtual_name=v_name, real_name=real_model, provider_id=sel_p.id)
+                                max_order = session.query(func.max(ModelMapping.order)).scalar() or 0
+                                new_m = ModelMapping(
+                                    virtual_name=v_name,
+                                    real_name=real_model,
+                                    provider_id=sel_p.id,
+                                    order=int(max_order) + 1,
+                                )
                                 session.add(new_m)
                                 session.commit()
                                 st.toast(f"映射已保存: {v_name} -> {real_model}")
@@ -693,25 +792,56 @@ elif menu == "模型映射管理":
 
         # 2. 列表展示
         st.subheader("映射列表")
-        with SessionLocal() as session:
-            mappings = session.query(ModelMapping, Provider).join(Provider).all()
+        mappings = get_ordered_model_mappings()
             
         if mappings:
-            h1, h2, h3, h4, h5 = st.columns([1, 3, 5, 2, 1])
-            h1.write("**ID**")
+            if HAS_SORTABLES:
+                st.caption("💡 拖拽下方条目后点击“保存拖拽顺序”，顺序将影响工具中的默认选择。")
+                drag_items = [
+                    f"{m.id} · {m.virtual_name} -> {m.real_name} ({p.name})"
+                    for m, p in mappings
+                ]
+                sorted_items = sort_items(drag_items, direction="vertical")
+                if st.button("💾 保存拖拽顺序", key="save_drag_model_order", width="stretch"):
+                    try:
+                        ordered_ids = [int(item.split(" · ", 1)[0]) for item in sorted_items]
+                        if apply_model_order(ordered_ids):
+                            st.success("模型顺序已保存")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"保存拖拽顺序失败: {e}")
+            else:
+                st.info("未安装拖拽组件，当前使用 ⬆️⬇️ 排序。安装 `streamlit-sortables` 后可启用拖拽。")
+                st.caption("💡 使用 ⬆️⬇️ 按钮调整模型顺序，顺序将影响工具中的默认选择")
+
+            h1, h2, h3, h4, h5, h6 = st.columns([1, 3, 5, 2, 2, 1])
+            h1.write("**#**")
             h2.write("**虚拟名称**")
             h3.write("**真实模型**")
             h4.write("**供应商**")
-            h5.write("**操作**")
+            h5.write("**排序**")
+            h6.write("**删除**")
             st.divider()
-            
-            for m, p in mappings:
-                c1, c2, c3, c4, c5 = st.columns([1, 3, 5, 2, 1])
-                c1.write(f"`{m.id}`")
+
+            for idx, (m, p) in enumerate(mappings):
+                c1, c2, c3, c4, c5, c6 = st.columns([1, 3, 5, 2, 2, 1])
+                c1.write(f"{idx + 1}")
                 c2.write(f"**{m.virtual_name}**")
                 c3.write(f"`{m.real_name}`")
                 c4.write(p.name)
-                if c5.button("🗑️", key=f"del_m_{m.id}"):
+                if HAS_SORTABLES:
+                    c5.caption("拖拽区调整")
+                else:
+                    # 上下移动按钮（拖拽组件不可用时的后备方案）
+                    btn_up = c5.button("⬆️", key=f"up_m_{m.id}", disabled=(idx == 0))
+                    btn_down = c5.button("⬇️", key=f"down_m_{m.id}", disabled=(idx == len(mappings) - 1))
+                    if btn_up and idx > 0:
+                        move_model_mapping(m.id, "up")
+                        st.rerun()
+                    if btn_down and idx < len(mappings) - 1:
+                        move_model_mapping(m.id, "down")
+                        st.rerun()
+                if c6.button("🗑️", key=f"del_m_{m.id}"):
                     if delete_item(ModelMapping, m.id, "模型映射已删除"):
                         st.rerun()
         else:
@@ -741,11 +871,47 @@ elif menu == "工具配置助手":
     master_key = os.getenv("MASTER_KEY", "sk-admin-123456")
     
     with SessionLocal() as session:
-        mappings = session.query(ModelMapping).all()
+        mappings = session.query(ModelMapping).order_by(ModelMapping.order, ModelMapping.id).all()
         v_models = [m.virtual_name for m in mappings]
-    
-    model_list = sorted(set(v_models)) if v_models else ["GLM5"]
+        tool_default_models = {tdm.tool_id: tdm.default_model for tdm in session.query(ToolDefaultModel).all()}
+
+    model_list = list(dict.fromkeys(v_models)) if v_models else ["GLM5"]
     model_hint = "GLM5" if "GLM5" in model_list else model_list[0]
+
+    st.subheader("🎯 默认模型配置")
+    st.caption("为不同工具选择默认模型，例如 ClaudeCode/OpenCode 适合编程模型，OpenClaw/Hermes 适合对话模型。")
+
+    tool_model_config = {}
+    tool_display_names = {
+        "claude_code": "Claude Code",
+        "opencode": "OpenCode",
+        "openclaw": "OpenClaw",
+        "hermes": "Hermes",
+    }
+    tool_cols = st.columns(4)
+    for i, (tool_id, display_name) in enumerate(tool_display_names.items()):
+        saved_default = tool_default_models.get(tool_id, model_hint)
+        if saved_default not in model_list:
+            saved_default = model_hint
+        selected = tool_cols[i].selectbox(
+            display_name,
+            options=model_list,
+            index=model_list.index(saved_default) if saved_default in model_list else 0,
+            key=f"tool_default_model_{tool_id}",
+        )
+        tool_model_config[tool_id] = selected
+
+    if st.button("💾 保存默认模型配置", key="save_tool_default_models", width="stretch"):
+        with SessionLocal() as session:
+            for tool_id, selected_model in tool_model_config.items():
+                existing = session.query(ToolDefaultModel).filter(ToolDefaultModel.tool_id == tool_id).first()
+                if existing:
+                    existing.default_model = selected_model
+                else:
+                    session.add(ToolDefaultModel(tool_id=tool_id, default_model=selected_model))
+            session.commit()
+        st.success("工具默认模型已保存")
+
     opencode_models_dict = {m: {"name": m} for m in model_list}
     opencode_config_data = {
         "$schema": "https://opencode.ai/config.json",
@@ -762,13 +928,14 @@ elif menu == "工具配置助手":
         },
     }
     opencode_config_content = json.dumps(opencode_config_data, ensure_ascii=False, indent=2)
+    hermes_default_model = tool_model_config.get("hermes", model_hint)
     hermes_config_content = "\n".join(
         [
             "model:",
             '  provider: "custom"',
             f'  api_base: "{proxy_url_v1}"',
             f'  api_key: "{master_key}"',
-            f'  model_name: "{model_hint}"',
+            f'  model_name: "{hermes_default_model}"',
             "",
         ]
     )
@@ -795,6 +962,12 @@ elif menu == "工具配置助手":
         
         config_detector = ConfigDetector()
         backup_manager = BackupManager()
+
+        detector_signature = json.dumps(config_detector.TOOL_CONFIGS, ensure_ascii=False, sort_keys=True)
+        if st.session_state.get("config_detector_signature") != detector_signature:
+            st.session_state.config_detector_signature = detector_signature
+            st.session_state.scan_result = None
+            st.session_state.selected_tools = {}
         
         if "scan_result" not in st.session_state:
             st.session_state.scan_result = None
@@ -846,7 +1019,12 @@ elif menu == "工具配置助手":
                 else:
                     col1.error("❌")
                     col2.write(f"**{result['display_name']}**")
-                    col3.caption(f"未检测到，标准位置: {result['config_path_hint']}")
+                    if tool_id == "opencode":
+                        opencode_paths = config_detector.TOOL_CONFIGS["opencode"]["standard_paths"]
+                        col3.caption("未检测到，候选位置（按优先级）：")
+                        col3.code("\n".join(opencode_paths), language="text")
+                    else:
+                        col3.caption(f"未检测到，标准位置: {result['config_path_hint']}")
                     st.session_state.selected_tools[tool_id] = col4.checkbox(
                         "创建并配置",
                         value=False,
@@ -860,13 +1038,13 @@ elif menu == "工具配置助手":
                 st.caption(f"已选择 {selected_count} 个工具进行自动配置")
                 tool_hints = []
                 if st.session_state.selected_tools.get("claude_code"):
-                    tool_hints.append(f"ClaudeCode (默认模型: {model_hint})")
+                    tool_hints.append(f"ClaudeCode (默认模型: {tool_model_config.get('claude_code', model_hint)})")
                 if st.session_state.selected_tools.get("opencode"):
-                    tool_hints.append(f"OpenCode (注入 {len(model_list)} 个代理模型)")
+                    tool_hints.append(f"OpenCode (默认模型: {tool_model_config.get('opencode', model_hint)}, 注入 {len(model_list)} 个代理模型)")
                 if st.session_state.selected_tools.get("openclaw"):
-                    tool_hints.append("OpenClaw")
+                    tool_hints.append(f"OpenClaw (默认模型: {tool_model_config.get('openclaw', model_hint)})")
                 if st.session_state.selected_tools.get("hermes"):
-                    tool_hints.append("Hermes")
+                    tool_hints.append(f"Hermes (默认模型: {tool_model_config.get('hermes', model_hint)})")
                 if tool_hints:
                     st.info("将为以下工具执行配置：\n- " + "\n- ".join(tool_hints))
                 
@@ -898,7 +1076,7 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             elif tool_id == "opencode":
                                 injector = OpenCodeInjector(
@@ -906,7 +1084,7 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             elif tool_id == "openclaw":
                                 injector = OpenClawInjector(
@@ -914,7 +1092,7 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             elif tool_id == "hermes":
                                 injector = HermesInjector(
@@ -922,7 +1100,7 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             
                             if injector:
@@ -977,7 +1155,7 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             elif tool_id == "opencode":
                                 injector = OpenCodeInjector(
@@ -985,7 +1163,7 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             elif tool_id == "openclaw":
                                 injector = OpenClawInjector(
@@ -993,7 +1171,7 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             elif tool_id == "hermes":
                                 injector = HermesInjector(
@@ -1001,18 +1179,42 @@ elif menu == "工具配置助手":
                                     proxy_base_url=base_host,
                                     proxy_api_key=master_key,
                                     model_list=model_list,
-                                    default_model=model_hint,
+                                    default_model=tool_model_config.get(tool_id, model_hint),
                                 )
                             
                             if injector:
-                                injector.inject()
+                                ok, err = injector.inject()
                                 st.markdown(f"**{result['display_name']}**")
+                                if not ok:
+                                    st.error(f"预览生成失败: {err or '未知错误'}")
+                                    st.caption(f"配置路径: {config_path}")
+                                    try:
+                                        with open(config_path, "r", encoding="utf-8") as f:
+                                            raw_text = f.read()
+                                        if raw_text.strip():
+                                            st.caption("原始文件内容（无法解析为标准 JSON）")
+                                            st.code(raw_text, language="json")
+                                        else:
+                                            st.caption("原始配置文件为空。")
+                                    except Exception:
+                                        st.caption("无法读取原始配置文件。")
+                                    st.markdown("---")
+                                    continue
+
                                 st.info(injector.generate_description())
                                 col_orig, col_mod = st.columns(2)
                                 col_orig.caption("原始配置")
-                                col_orig.json(injector.original_config)
                                 col_mod.caption("修改后配置")
-                                col_mod.json(injector.modified_config)
+
+                                # Hermes 为 YAML 文本，优先展示原始/修改后文本
+                                if hasattr(injector, "original_text") and hasattr(injector, "modified_text"):
+                                    original_text = (getattr(injector, "original_text", "") or "").strip()
+                                    modified_text = (getattr(injector, "modified_text", "") or "").strip()
+                                    col_orig.code(original_text or "(空)", language="yaml")
+                                    col_mod.code(modified_text or "(空)", language="yaml")
+                                else:
+                                    col_orig.json(injector.original_config)
+                                    col_mod.json(injector.modified_config)
                                 st.markdown("---")
                         if st.button("关闭预览"):
                             st.session_state.show_preview = False
@@ -1030,7 +1232,9 @@ elif menu == "工具配置助手":
         selected_claude_model = st.selectbox(
             "选择 Claude Code 默认模型",
             options=model_list,
-            index=model_list.index(model_hint) if model_hint in model_list else 0,
+            index=model_list.index(tool_model_config.get("claude_code", model_hint))
+            if tool_model_config.get("claude_code", model_hint) in model_list
+            else 0,
             key="claude_default_model",
         )
         claude_settings_content = json.dumps(
@@ -1089,7 +1293,9 @@ elif menu == "工具配置助手":
         selected_opencode_model = st.selectbox(
             "选择 OpenCode 启动模型",
             options=model_list,
-            index=model_list.index(model_hint) if model_hint in model_list else 0,
+            index=model_list.index(tool_model_config.get("opencode", model_hint))
+            if tool_model_config.get("opencode", model_hint) in model_list
+            else 0,
             key="opencode_default_model",
         )
         opencode_start_content = (
@@ -1104,6 +1310,7 @@ elif menu == "工具配置助手":
         st.markdown(f"""
         OpenCode 更适合通过 OpenAI 兼容 Provider 配置接入本地代理。
         这里的 Key 同样是**本地代理访问 Key**，不是上游平台的 Key。
+        OpenCode 全局默认配置文件通常位于：`~/.config/opencode/opencode.json`。
 
         **1. 生成配置文件**:
         点击下方按钮会在当前目录生成 `opencode.json`，内容已经指向 `{proxy_url_v1}`。
@@ -1135,6 +1342,7 @@ elif menu == "工具配置助手":
             f"$env:OPENCODE_CONFIG='opencode.json'; opencode -m aiproxy/{selected_opencode_model}",
             language="powershell"
         )
+        st.caption("如果你不想每次设置环境变量，请把配置写入 `~/.config/opencode/opencode.json`。")
 
         st.markdown("---")
         st.caption("说明：OpenCode 这里应使用 OpenAI 兼容入口，所以 Base URL 需要带 `/v1`。")
