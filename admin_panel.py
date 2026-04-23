@@ -1581,6 +1581,14 @@ elif menu == "模型体验":
                 text_models = [m for m in provider_models if classify_model_type(m) == "text"]
                 image_models = [m for m in provider_models if classify_model_type(m) == "image"]
                 st.caption(f"检测结果：文本模型 {len(text_models)} 个，图片模型 {len(image_models)} 个。")
+
+                # --- 改进7: 模型搜索过滤 ---
+                model_filter = st.text_input("🔍 搜索模型名称", value="", placeholder="输入关键词过滤模型列表...", key=f"model_filter_{selected_provider.id}")
+                if model_filter.strip():
+                    _filter_lower = model_filter.strip().lower()
+                    text_models = [m for m in text_models if _filter_lower in m.lower()]
+                    image_models = [m for m in image_models if _filter_lower in m.lower()]
+
                 with st.expander("查看供应商返回的原始模型列表（调试）", expanded=False):
                     st.write(provider_models)
                 force_all_for_image = st.checkbox(
@@ -1588,22 +1596,72 @@ elif menu == "模型体验":
                     value=False,
                     key=f"force_all_image_models_{selected_provider.id}",
                 )
-                image_model_options = provider_models if force_all_for_image else image_models
+                if force_all_for_image:
+                    image_model_options = [m for m in provider_models if (not model_filter.strip() or model_filter.strip().lower() in m.lower())]
+                else:
+                    image_model_options = image_models
 
                 t_chat, t_image = st.tabs(["文本对话", "图片生成"])
 
                 with t_chat:
                     st.subheader("文本模型对话")
                     if not text_models:
-                        st.info("当前供应商模型列表中未识别到文本模型。")
+                        st.info("当前供应商模型列表中未识别到文本模型。" + (" (可能被搜索过滤)" if model_filter.strip() else ""))
                     else:
                         chat_model = st.selectbox("选择文本模型", options=text_models, key="playground_chat_model")
-                        chat_max_tokens = st.slider("max_tokens", min_value=32, max_value=4096, value=512, step=32)
+
+                        # --- 改进3: 提高 max_tokens 上限 ---
+                        chat_max_tokens = st.slider("max_tokens", min_value=32, max_value=65536, value=4096, step=32)
                         chat_temperature = st.slider("temperature", min_value=0.0, max_value=1.5, value=0.7, step=0.1)
+
+                        # --- 改进2: System Prompt ---
+                        sys_prompt_key = f"system_prompt_{selected_provider.id}_{chat_model}"
+                        if sys_prompt_key not in st.session_state:
+                            st.session_state[sys_prompt_key] = ""
+                        system_prompt = st.text_area(
+                            "System Prompt（可选）",
+                            value=st.session_state[sys_prompt_key],
+                            key=f"sys_prompt_input_{selected_provider.id}_{chat_model}",
+                            placeholder="设置系统提示词，留空则不发送 system 消息...",
+                            height=80,
+                        )
+                        st.session_state[sys_prompt_key] = system_prompt
 
                         chat_state_key = f"chat_history_{selected_provider.id}_{chat_model}"
                         if chat_state_key not in st.session_state:
                             st.session_state[chat_state_key] = []
+
+                        # --- 改进4: 对话管理按钮 ---
+                        btn_col1, btn_col2, btn_col3 = st.columns(3)
+                        with btn_col1:
+                            if st.button("🆕 新建对话", key=f"new_chat_{selected_provider.id}_{chat_model}", use_container_width=True):
+                                st.session_state[chat_state_key] = []
+                                st.rerun()
+                        with btn_col2:
+                            if st.button("🗑️ 清空当前对话", key=f"clear_chat_{selected_provider.id}_{chat_model}", use_container_width=True):
+                                st.session_state[chat_state_key] = []
+                                st.rerun()
+                        with btn_col3:
+                            # --- 改进5: 对话导出 ---
+                            if st.session_state[chat_state_key]:
+                                _export_lines = [f"# 模型体验对话记录\n", f"- 供应商: {selected_provider_name}\n", f"- 模型: {chat_model}\n", f"- 导出时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n"]
+                                for _msg in st.session_state[chat_state_key]:
+                                    _role_label = "🧑 用户" if _msg["role"] == "user" else "🤖 助手"
+                                    _export_lines.append(f"### {_role_label}\n\n{_msg['content']}\n\n")
+                                _export_md = "".join(_export_lines)
+                                st.download_button(
+                                    "📥 导出对话",
+                                    data=_export_md,
+                                    file_name=f"chat_{chat_model.replace('/', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                                    mime="text/markdown",
+                                    key=f"export_chat_{selected_provider.id}_{chat_model}",
+                                    use_container_width=True,
+                                )
+                            else:
+                                st.button("📥 导出对话", disabled=True, key=f"export_chat_disabled_{selected_provider.id}_{chat_model}", use_container_width=True)
+
+                        if st.session_state[chat_state_key]:
+                            st.caption(f"当前对话 {len(st.session_state[chat_state_key])} 条消息 · 模型: {chat_model}")
 
                         for msg in st.session_state[chat_state_key]:
                             with st.chat_message(msg["role"]):
@@ -1620,29 +1678,54 @@ elif menu == "模型体验":
                                 "Authorization": f"Bearer {selected_key.key}",
                                 "Content-Type": "application/json",
                             }
+                            # 构建消息列表，含可选 system prompt
+                            _send_messages = []
+                            if system_prompt.strip():
+                                _send_messages.append({"role": "system", "content": system_prompt.strip()})
+                            _send_messages.extend(st.session_state[chat_state_key])
+
+                            # --- 改进1: 流式输出 ---
                             payload = {
                                 "model": chat_model,
-                                "messages": st.session_state[chat_state_key],
+                                "messages": _send_messages,
                                 "max_tokens": chat_max_tokens,
                                 "temperature": chat_temperature,
-                                "stream": False,
+                                "stream": True,
                             }
                             try:
-                                resp = requests.post(url, headers=headers, json=payload, timeout=120)
+                                resp = requests.post(url, headers=headers, json=payload, timeout=120, stream=True)
                                 if resp.status_code == 200:
-                                    data = resp.json()
-                                    assistant_text = (
-                                        (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
-                                        or "(空响应)"
-                                    )
-                                    st.session_state[chat_state_key].append({"role": "assistant", "content": assistant_text})
+                                    # 流式解析 SSE
+                                    collected_text = []
+                                    usage_data = {}
                                     with st.chat_message("assistant"):
-                                        st.markdown(assistant_text)
+                                        placeholder = st.empty()
+                                        for line in resp.iter_lines(decode_unicode=True):
+                                            if not line or not line.startswith("data: "):
+                                                continue
+                                            data_str = line[6:]
+                                            if data_str.strip() == "[DONE]":
+                                                break
+                                            try:
+                                                chunk = json.loads(data_str)
+                                                delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
+                                                content_piece = delta.get("content") or ""
+                                                if content_piece:
+                                                    collected_text.append(content_piece)
+                                                    placeholder.markdown("".join(collected_text) + "▌")
+                                                # 提取最后一个 chunk 的 usage
+                                                if chunk.get("usage"):
+                                                    usage_data = chunk["usage"]
+                                            except (json.JSONDecodeError, Exception):
+                                                continue
+                                        # 最终显示（去掉光标）
+                                        final_text = "".join(collected_text) or "(空响应)"
+                                        placeholder.markdown(final_text)
 
-                                    usage = data.get("usage", {}) if isinstance(data, dict) else {}
-                                    ptk = usage.get("prompt_tokens", 0) or 0
-                                    ctk = usage.get("completion_tokens", 0) or 0
-                                    ttk = usage.get("total_tokens", ptk + ctk) or (ptk + ctk)
+                                    st.session_state[chat_state_key].append({"role": "assistant", "content": final_text})
+                                    ptk = (usage_data.get("prompt_tokens") or 0)
+                                    ctk = (usage_data.get("completion_tokens") or 0)
+                                    ttk = (usage_data.get("total_tokens") or (ptk + ctk))
                                     log_custom_usage(
                                         key_id=selected_key.id,
                                         model_name=chat_model,
@@ -1654,10 +1737,6 @@ elif menu == "模型体验":
                                     st.error(f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}")
                             except Exception as e:
                                 st.error(f"请求异常：{e}")
-
-                        if st.button("清空当前对话", key=f"clear_chat_{selected_provider.id}_{chat_model}"):
-                            st.session_state[chat_state_key] = []
-                            st.rerun()
 
                 with t_image:
                     st.subheader("文生图模型生成")
@@ -1678,6 +1757,11 @@ elif menu == "模型体验":
                     image_prompt = st.text_area("Prompt", value="A cinematic cyberpunk city at dusk, ultra detailed")
                     image_size = st.selectbox("尺寸", options=["1024x1024", "1024x1792", "1792x1024"], index=0)
                     image_n = st.slider("生成数量", min_value=1, max_value=4, value=1, step=1)
+
+                    # --- 改进6: 图片生成历史 ---
+                    _img_history_key = f"image_history_{selected_provider.id}"
+                    if _img_history_key not in st.session_state:
+                        st.session_state[_img_history_key] = []
 
                     if st.button("生成图片", key=f"generate_image_{selected_provider.id}", width="stretch"):
                         if not image_model:
@@ -1706,12 +1790,14 @@ elif menu == "模型体验":
                                     else:
                                         for idx, item in enumerate(images):
                                             st.markdown(f"**图片 {idx + 1}**")
+                                            _img_data_for_history = None
                                             if item.get("url"):
                                                 img_url = item["url"]
                                                 st.image(img_url, caption=f"{image_model} - {image_size}")
                                                 try:
                                                     img_resp = requests.get(img_url, timeout=60)
                                                     if img_resp.status_code == 200:
+                                                        _img_data_for_history = base64.b64encode(img_resp.content).decode()
                                                         st.download_button(
                                                             label=f"下载图片 {idx + 1}",
                                                             data=img_resp.content,
@@ -1723,6 +1809,7 @@ elif menu == "模型体验":
                                                     pass
                                             elif item.get("b64_json"):
                                                 img_bytes = base64.b64decode(item["b64_json"])
+                                                _img_data_for_history = item["b64_json"]
                                                 st.image(img_bytes, caption=f"{image_model} - {image_size}")
                                                 st.download_button(
                                                     label=f"下载图片 {idx + 1}",
@@ -1731,6 +1818,18 @@ elif menu == "模型体验":
                                                     mime="image/png",
                                                     key=f"download_b64_img_{selected_provider.id}_{idx}",
                                                 )
+                                            # 保存到历史
+                                            if _img_data_for_history:
+                                                st.session_state[_img_history_key].append({
+                                                    "prompt": image_prompt,
+                                                    "model": image_model,
+                                                    "size": image_size,
+                                                    "b64": _img_data_for_history,
+                                                    "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                                })
+                                                # 限制历史最多 20 张
+                                                if len(st.session_state[_img_history_key]) > 20:
+                                                    st.session_state[_img_history_key] = st.session_state[_img_history_key][-20:]
                                     log_custom_usage(
                                         key_id=selected_key.id,
                                         model_name=image_model,
@@ -1740,6 +1839,29 @@ elif menu == "模型体验":
                                     st.error(f"请求失败：HTTP {resp.status_code}，{resp.text[:500]}")
                             except Exception as e:
                                 st.error(f"请求异常：{e}")
+
+                    # 显示图片生成历史
+                    if st.session_state[_img_history_key]:
+                        with st.expander(f"📸 图片生成历史（{len(st.session_state[_img_history_key])} 张）", expanded=False):
+                            for _hi, _hitem in enumerate(reversed(st.session_state[_img_history_key])):
+                                st.caption(f"{_hitem['time']} · {_hitem['model']} · {_hitem['size']}")
+                                st.text(f"Prompt: {_hitem['prompt'][:100]}{'...' if len(_hitem['prompt']) > 100 else ''}")
+                                try:
+                                    _h_bytes = base64.b64decode(_hitem["b64"])
+                                    st.image(_h_bytes, width=256)
+                                    st.download_button(
+                                        label=f"下载",
+                                        data=_h_bytes,
+                                        file_name=f"{_hitem['model'].replace('/', '_')}_{_hi}.png",
+                                        mime="image/png",
+                                        key=f"download_history_img_{selected_provider.id}_{_hi}",
+                                    )
+                                except Exception:
+                                    st.warning("图片数据已失效")
+                                st.divider()
+                            if st.button("🗑️ 清空图片历史", key=f"clear_img_history_{selected_provider.id}"):
+                                st.session_state[_img_history_key] = []
+                                st.rerun()
 
 elif menu == "系统设置":
     st.header("⚙️ 系统配置")
