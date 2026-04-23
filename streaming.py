@@ -88,7 +88,11 @@ class StreamGenerator:
                     continue
 
                 chunk = maybe_chunk
-                payload = serialize_stream_chunk(chunk)
+                try:
+                    payload = serialize_stream_chunk(chunk)
+                except Exception as e:
+                    logger.warning(f"流式chunk解析失败，跳过: {e}")
+                    continue
                 merge_usage(self.usage_totals, payload.get("usage"))
                 final_finish_reason = ((payload.get("choices") or [{}])[0].get("finish_reason"))
 
@@ -124,6 +128,13 @@ class StreamGenerator:
                         pass
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+        except (asyncio.CancelledError, ConnectionError, Exception) as e:
+            if not isinstance(e, asyncio.CancelledError):
+                logger.error(f"流式响应中断: {type(e).__name__}: {e}")
+            if self.is_anthropic:
+                yield sse_event("error", {"type": "error", "error": {"type": "stream_error", "message": str(e)}})
+            else:
+                yield f"data: {{\"error\": {{\"message\": \"流式响应中断: {type(e).__name__}\", \"type\": \"stream_error\"}}}}\n\n"
         finally:
             await self._finalize_usage()
 

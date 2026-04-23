@@ -36,7 +36,7 @@ log "Upgrading pip..."
 python -m pip install --upgrade pip
 
 log "Installing dependencies..."
-python -m pip install -r requirements.txt
+#python -m pip install -r requirements.txt
 
 if [ ! -f ".env" ]; then
   log "Creating .env from .env.example..."

@@ -2,7 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import Session
-from db import SessionLocal, sync_engine, Provider, APIKey, ModelMapping, UsageLog, Base, ToolDefaultModel
+from db import SessionLocal, sync_engine, Provider, APIKey, ModelMapping, UsageLog, Base, ToolDefaultModel, SUPPORTED_PROVIDER_TYPES
 import pandas as pd
 import datetime
 import requests
@@ -33,6 +33,22 @@ if 'db_initialized' not in st.session_state:
 
 st.set_page_config(page_title="AI Proxy Master Admin", layout="wide", initial_sidebar_state="expanded")
 
+# --- 密码认证 ---
+_admin_password = os.getenv("ADMIN_PASSWORD", "")
+if _admin_password:
+    if "admin_authenticated" not in st.session_state:
+        st.session_state.admin_authenticated = False
+    if not st.session_state.admin_authenticated:
+        st.title("🔐 管理面板登录")
+        pwd = st.text_input("请输入管理密码", type="password")
+        if st.button("登录"):
+            if pwd == _admin_password:
+                st.session_state.admin_authenticated = True
+                st.rerun()
+            else:
+                st.error("密码错误")
+        st.stop()
+
 # --- 界面样式优化 ---
 st.markdown("""
     <style>
@@ -58,6 +74,9 @@ def delete_item(model_class, item_id, success_msg):
         try:
             if model_class == Provider:
                 # 级联删除关联数据
+                key_ids = [k.id for k in session.query(APIKey).filter(APIKey.provider_id == item_id).all()]
+                if key_ids:
+                    session.query(UsageLog).filter(UsageLog.key_id.in_(key_ids)).delete(synchronize_session=False)
                 session.query(APIKey).filter(APIKey.provider_id == item_id).delete()
                 session.query(ModelMapping).filter(ModelMapping.provider_id == item_id).delete()
             
@@ -555,25 +574,95 @@ if menu == "使用概览":
 
 elif menu == "供应商管理":
     st.header("🔌 供应商配置")
+
+    # 使用说明
+    with st.expander("📖 各类型供应商配置说明", expanded=False):
+        st.markdown("""
+**OpenAI 兼容**（默认）  
+适用于 NVIDIA、DeepSeek、vLLM、OneAPI 等 OpenAI 兼容接口。  
+- 填写 API Base URL 和 API Key 即可。
+
+**Anthropic 原生**  
+直连 Claude API。  
+- API Base URL 填 `https://api.anthropic.com`（或自定义代理地址）  
+- API Key 填 Anthropic API Key
+
+**Google Gemini（API Key）**  
+通过 Google AI Studio 的 API Key 访问 Gemini 模型。  
+- API Base URL：留空（自动处理）  
+- API Key：填 Google AI Studio 的 API Key
+
+**Google Vertex AI（OAuth / Service Account）**  
+通过 GCP Service Account 认证，无需 API Key。  
+- API Base URL：留空  
+- API Key：填任意占位符（如 `placeholder`，不会实际使用）  
+- 需要在 `.env` 中配置：
+  ```
+  GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+  VERTEXAI_PROJECT=your-gcp-project-id
+  VERTEXAI_LOCATION=us-central1
+  ```
+- Docker 部署时需挂载 credentials 目录
+
+**AWS Bedrock（IAM 认证）**  
+通过 AWS IAM 认证，无需 API Key。  
+- API Base URL：留空  
+- API Key：填任意占位符  
+- 需要在 `.env` 中配置：
+  ```
+  AWS_ACCESS_KEY_ID=your-access-key
+  AWS_SECRET_ACCESS_KEY=your-secret-key
+  AWS_DEFAULT_REGION=us-east-1
+  ```
+
+**Azure OpenAI**  
+- API Base URL：填 Azure 部署的 endpoint（如 `https://xxx.openai.azure.com`）  
+- API Key：填 Azure API Key
+
+**Ollama**  
+- API Base URL：填 Ollama 地址（如 `http://localhost:11434`）  
+- API Key：填任意占位符
+        """)
+
+    # 不需要 API Base URL 的供应商类型
+    _NO_BASE_URL_TYPES = {"vertex_ai", "bedrock", "gemini", "cohere", "mistral"}
     
     # 1. 添加表单
     with st.expander("➕ 添加新供应商", expanded=False):
         with st.form("add_p", clear_on_submit=True):
             name = st.text_input("供应商名称").strip()
-            base_url = st.text_input("API Base URL", value="https://integrate.api.nvidia.com/v1").strip()
+            provider_type_options = list(SUPPORTED_PROVIDER_TYPES.keys())
+            provider_type_labels = [f"{k} - {v}" for k, v in SUPPORTED_PROVIDER_TYPES.items()]
+            selected_type_idx = st.selectbox(
+                "上游协议类型",
+                options=range(len(provider_type_options)),
+                format_func=lambda i: provider_type_labels[i],
+                index=0,
+                help="选择上游 API 的协议类型。OpenAI 兼容适用于 NVIDIA、DeepSeek、vLLM 等；Anthropic 原生适用于直连 Claude API。",
+            )
+            selected_type = provider_type_options[selected_type_idx]
+            _base_url_required = selected_type not in _NO_BASE_URL_TYPES
+            base_url_help = "留空即可，该类型无需 API Base URL" if not _base_url_required else ""
+            base_url = st.text_input(
+                "API Base URL",
+                value="https://integrate.api.nvidia.com/v1" if _base_url_required else "",
+                help=base_url_help,
+            ).strip()
             if st.form_submit_button("保存供应商", width="stretch"):
                 base_url = base_url.strip().strip("`").strip("'").strip("\"")
-                if not name or not base_url:
-                    st.error("请完整填写信息")
+                if not name:
+                    st.error("请填写供应商名称")
+                elif _base_url_required and not base_url:
+                    st.error("该供应商类型需要填写 API Base URL")
                 else:
                     with SessionLocal() as session:
                         if session.query(Provider).filter(Provider.name == name).first():
                             st.error(f"供应商 '{name}' 已存在")
                         else:
-                            new_p = Provider(name=name, api_base=base_url)
+                            new_p = Provider(name=name, api_base=base_url, provider_type=selected_type)
                             session.add(new_p)
                             session.commit()
-                            st.toast(f"已添加供应商: {name}")
+                            st.toast(f"已添加供应商: {name} ({selected_type})")
                             st.rerun()
 
     # 2. 列表展示
@@ -582,19 +671,23 @@ elif menu == "供应商管理":
         providers = session.query(Provider).all()
     
     if providers:
-        h1, h2, h3, h4 = st.columns([1, 2, 5, 1])
+        h1, h2, h3, h4, h5 = st.columns([1, 2, 2, 4, 1])
         h1.write("**ID**")
         h2.write("**名称**")
-        h3.write("**Base URL**")
-        h4.write("**操作**")
+        h3.write("**协议类型**")
+        h4.write("**Base URL**")
+        h5.write("**操作**")
         st.divider()
         
         for p in providers:
-            c1, c2, c3, c4 = st.columns([1, 2, 5, 1])
+            c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 4, 1])
             c1.write(f"`{p.id}`")
             c2.write(p.name)
-            c3.write(f"`{p.api_base}`")
-            if c4.button("🗑️", key=f"del_p_{p.id}"):
+            p_type = getattr(p, 'provider_type', 'openai') or 'openai'
+            type_label = SUPPORTED_PROVIDER_TYPES.get(p_type, p_type)
+            c3.write(f"`{p_type}` {type_label.split('（')[0].split('(')[0].strip()}")
+            c4.write(f"`{p.api_base}`")
+            if c5.button("🗑️", key=f"del_p_{p.id}"):
                 if delete_item(Provider, p.id, f"已删除供应商: {p.name}"):
                     st.rerun()
     else:
@@ -613,8 +706,12 @@ elif menu == "API Key 管理":
         with st.expander("➕ 添加 API Key", expanded=False):
             with st.form("add_k", clear_on_submit=True):
                 p_map = {p.name: p.id for p in providers}
+                p_type_map = {p.name: getattr(p, 'provider_type', 'openai') or 'openai' for p in providers}
                 target_p = st.selectbox("选择供应商", options=list(p_map.keys()))
-                key_val = st.text_input("API Key", type="password").strip()
+                _selected_p_type = p_type_map.get(target_p, 'openai')
+                _is_oauth_type = _selected_p_type in ('vertex_ai', 'bedrock')
+                key_help = "该供应商通过环境变量认证，此处填任意占位符即可（如 placeholder）" if _is_oauth_type else ""
+                key_val = st.text_input("API Key", type="password", help=key_help).strip()
                 if st.form_submit_button("保存 Key", width="stretch"):
                     key_val = key_val.strip().strip("`").strip("'").strip("\"")
                     if not key_val:

@@ -11,14 +11,18 @@ services:
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env:ro
+      # Vertex AI Service Account 密钥文件（取消注释并确保文件存在）
+      # - ./credentials:/app/credentials:ro
     environment:
       - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
     networks:
       - aiproxy_network
 
 networks:
   aiproxy_network:
     driver: bridge
-
-volumes:
-  aiproxy_data:

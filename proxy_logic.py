@@ -1,7 +1,10 @@
 """AI Proxy Gateway - 主入口"""
 
+import json
 import time
 import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import litellm
@@ -24,6 +27,8 @@ from services import (
     build_completion_params,
     clean_config_value,
     clear_key_failure,
+    execute_image_generation,
+    execute_nvidia_image_generation,
     get_active_keys,
     get_model_mapping,
     log_usage,
@@ -31,8 +36,50 @@ from services import (
 )
 from streaming import AnthropicToolStreamGenerator, StreamGenerator
 
-app = FastAPI(title="AI Proxy Gateway")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    logger.info("Database initialized")
+    yield
+
+
+app = FastAPI(title="AI Proxy Gateway", lifespan=lifespan)
 security = HTTPBearer(auto_error=False)
+
+# --- 简易内存速率限制 ---
+_rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
+_rate_limit_last_cleanup: float = 0.0
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Per-IP 速率限制，RATE_LIMIT_PER_MINUTE=0 时不限制。
+    注意：基于进程内存，多 worker 模式下每个进程独立计数，实际限流不精确。
+    生产环境多 worker 时建议使用 Redis 等外部存储做限流。
+    """
+    global _rate_limit_last_cleanup
+    limit = settings.rate_limit_per_minute
+    if limit > 0:
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        cutoff = now - 60
+        # 每 5 分钟清理一次过期 IP 条目，防止内存泄漏
+        if now - _rate_limit_last_cleanup > 300:
+            _rate_limit_last_cleanup = now
+            stale = [ip for ip, ts in _rate_limit_buckets.items() if not ts or ts[-1] < cutoff]
+            for ip in stale:
+                del _rate_limit_buckets[ip]
+        bucket = _rate_limit_buckets[client_ip]
+        # 清理 60s 前的记录
+        _rate_limit_buckets[client_ip] = bucket = [t for t in bucket if t > cutoff]
+        if len(bucket) >= limit:
+            return JSONResponse(
+                status_code=429,
+                content={"error": {"message": f"Rate limit exceeded: {limit} requests/min", "type": "rate_limit_error"}},
+                headers={"Retry-After": "60"},
+            )
+        bucket.append(now)
+    return await call_next(request)
 
 
 def _resolve_timeout_value(request_value: object, default_value: float) -> float:
@@ -83,12 +130,6 @@ async def log_requests(request: Request, call_next):
         return response
     finally:
         request_id_ctx.reset(token)
-
-
-@app.on_event("startup")
-async def startup():
-    await init_db()
-    logger.info("Database initialized")
 
 
 @app.get("/health")
@@ -243,7 +284,7 @@ async def anthropic_proxy(request: Request, x_api_key: Optional[str] = Header(No
 
     if settings.auth_enabled:
         if not api_key or api_key != settings.master_key:
-            logger.warning(f"Auth failed. Expected: {settings.master_key}, Got: {api_key}")
+            logger.warning(f"Auth failed. Expected: {mask_secret(settings.master_key)}, Got: {mask_secret(api_key)}")
             return JSONResponse(
                 status_code=401,
                 content={"error": {"type": "authentication_error", "message": "Invalid API Key"}},
@@ -321,6 +362,19 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 if stream and is_anthropic and not request_stream:
                     response = await litellm.acompletion(**completion_kwargs)
                     await clear_key_failure(session, api_key.id)
+
+                    # 检查非流式响应大小，防止超大响应占满内存（50MB 上限）
+                    try:
+                        from converters import serialize_response_obj
+                        response_size = len(json.dumps(serialize_response_obj(response), ensure_ascii=False))
+                        if response_size > 50 * 1024 * 1024:
+                            logger.warning(f"Upstream response too large ({response_size} bytes), rejecting")
+                            raise HTTPException(status_code=502, detail="Upstream response too large")
+                    except (TypeError, HTTPException):
+                        raise
+                    except Exception:
+                        pass  # 序列化失败不阻塞正常流程
+
                     generator = AnthropicToolStreamGenerator(
                         final_response=response,
                         model_name=model_name,
@@ -374,6 +428,8 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
 
                 return response
 
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Key {api_key.id} failed: {e}")
                 last_error = str(e)
@@ -429,10 +485,24 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
 @app.post("/v1/images/generations")
 @app.post("/images/generations")
 async def image_proxy(request: Request, auth=Depends(verify_auth)):
-    """图片生成接口"""
-    from services import execute_image_generation
-
+    """图片生成接口，根据 provider_type 自动路由"""
     body = await request.json()
+    model_name = body.get("model")
+    if not model_name:
+        raise HTTPException(status_code=400, detail="Missing required field: model")
+
+    # 查询 provider_type 决定走哪个处理器
+    async with AsyncSessionLocal() as session:
+        from db import ModelMapping, Provider
+        stmt = select(ModelMapping, Provider).join(Provider).where(ModelMapping.virtual_name == model_name)
+        result = await session.execute(stmt)
+        mapping_data = result.first()
+        if mapping_data:
+            _, provider = mapping_data
+            p_type = (getattr(provider, "provider_type", None) or "openai").strip().lower()
+            if p_type == "nvidia_image":
+                return await execute_nvidia_image_generation(body)
+
     return await execute_image_generation(body)
 
 

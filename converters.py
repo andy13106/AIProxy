@@ -203,13 +203,13 @@ def normalize_tool_input(tool_name: str, tool_input: Any) -> dict:
     elif isinstance(tool_input, str):
         text = tool_input.strip()
         parsed = None
-        if text:
+        if text and len(text) <= 1_000_000:  # 限制解析长度，防止 DoS
             try:
                 parsed = json.loads(text)
             except Exception:
                 try:
                     parsed = ast.literal_eval(text)
-                except Exception:
+                except (ValueError, SyntaxError, RecursionError, MemoryError):
                     parsed = None
         if isinstance(parsed, dict):
             normalized = dict(parsed)
@@ -331,7 +331,7 @@ def convert_openai_response_to_anthropic(response: Any, model_name: str) -> dict
                 try:
                     parsed = ast.literal_eval(raw_args)
                     tool_input = parsed if isinstance(parsed, dict) else {"raw_arguments": raw_args}
-                except Exception:
+                except (ValueError, SyntaxError, RecursionError, MemoryError):
                     tool_input = {"raw_arguments": raw_args}
         elif isinstance(raw_args, dict):
             tool_input = raw_args

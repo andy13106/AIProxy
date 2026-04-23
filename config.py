@@ -17,13 +17,13 @@ class Settings:
     """应用配置"""
 
     # 认证配置
-    master_key: str = field(default_factory=lambda: os.getenv("MASTER_KEY", "sk-admin-123456"))
+    master_key: str = field(default_factory=lambda: os.getenv("MASTER_KEY", ""))
     auth_enabled: bool = field(default_factory=lambda: os.getenv("AUTH_ENABLED", "true").lower() == "true")
 
     # 超时配置
-    upstream_timeout_sec: float = field(default_factory=lambda: float(os.getenv("UPSTREAM_TIMEOUT_SEC", "180")))
+    upstream_timeout_sec: float = field(default_factory=lambda: float(os.getenv("UPSTREAM_TIMEOUT_SEC", "90")))
     request_total_timeout_sec: float = field(
-        default_factory=lambda: float(os.getenv("REQUEST_TOTAL_TIMEOUT_SEC", "240"))
+        default_factory=lambda: float(os.getenv("REQUEST_TOTAL_TIMEOUT_SEC", "180"))
     )
     allow_client_timeout_override: bool = field(
         default_factory=lambda: os.getenv("ALLOW_CLIENT_TIMEOUT_OVERRIDE", "false").lower() == "true"
@@ -46,6 +46,12 @@ class Settings:
     proxy_port: str = field(default_factory=lambda: os.getenv("PROXY_PORT", "8000"))
     admin_host: str = field(default_factory=lambda: os.getenv("ADMIN_HOST", "0.0.0.0"))
     admin_port: str = field(default_factory=lambda: os.getenv("ADMIN_PORT", "8501"))
+
+    # 速率限制（0 = 不限制）
+    rate_limit_per_minute: int = field(default_factory=lambda: int(os.getenv("RATE_LIMIT_PER_MINUTE", "0")))
+
+    # 管理面板密码（空 = 不需要密码）
+    admin_password: str = field(default_factory=lambda: os.getenv("ADMIN_PASSWORD", ""))
 
     # 日志级别
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
@@ -108,6 +114,11 @@ def setup_logging(config: Settings) -> logging.Logger:
 
 # 全局配置实例
 settings = Settings()
+
+# 安全检查：MASTER_KEY 不能为空
+if settings.auth_enabled and not settings.master_key:
+    print("[FATAL] MASTER_KEY 未设置，请在环境变量或 .env 文件中设置 MASTER_KEY")
+    sys.exit(1)
 
 # 全局日志实例
 logger = setup_logging(settings)

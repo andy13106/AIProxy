@@ -119,8 +119,18 @@ def start_services() -> None:
     except KeyboardInterrupt:
         print("\nStopping services...")
         backend_process.terminate()
+        try:
+            backend_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            backend_process.kill()
+            backend_process.wait()
         if frontend_process is not None:
             frontend_process.terminate()
+            try:
+                frontend_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                frontend_process.kill()
+                frontend_process.wait()
         print("Services stopped.")
 
 

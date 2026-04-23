@@ -14,7 +14,7 @@ class AIAnalyzer:
 
     def __init__(self, proxy_base_url: str = "http://localhost:8000", api_key: str = ""):
         self.proxy_base_url = proxy_base_url
-        self.api_key = api_key or os.getenv("MASTER_KEY", "sk-admin-123456")
+        self.api_key = api_key or os.getenv("MASTER_KEY", "")
         self.default_model = "GLM5"
 
     def _build_prompt(self, config_content: str, tool_type: str) -> str:

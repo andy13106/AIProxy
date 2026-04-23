@@ -1,15 +1,18 @@
 """业务逻辑模块"""
 
+import base64
 import datetime
 import threading
 from collections import defaultdict
 from typing import Any, Optional
 
+import httpx
 import litellm
 from fastapi import HTTPException
 from sqlalchemy import select, update
 
 from config import logger, settings
+from db import UsageLog
 from converters import (
     convert_anthropic_messages_to_openai,
     convert_anthropic_tool_choice,
@@ -148,10 +151,13 @@ def build_completion_params(
     api_key: APIKey,
     is_anthropic: bool,
     request_stream: bool,
-) -> dict:
+) -> tuple[dict, str, list]:
     """构建 litellm 请求参数"""
     messages = body.get("messages") or []
     tools = body.get("tools") or []
+
+    # 获取上游供应商协议类型
+    upstream_type = (getattr(provider, "provider_type", None) or "openai").strip().lower()
 
     if is_anthropic:
         messages = convert_anthropic_messages_to_openai(messages)
@@ -165,7 +171,7 @@ def build_completion_params(
 
     logger.debug(
         f"Mapping {body.get('model')} -> {clean_real_model} "
-        f"via {clean_api_base}, key_suffix={clean_api_key[-6:] if len(clean_api_key) >= 6 else clean_api_key}"
+        f"via {clean_api_base} (type={upstream_type}), key_suffix={clean_api_key[-6:] if len(clean_api_key) >= 6 else clean_api_key}"
     )
 
     extra_body = body.get("extra_body") or {}
@@ -180,14 +186,52 @@ def build_completion_params(
         "model": clean_real_model,
         "messages": messages,
         "api_key": clean_api_key,
-        "api_base": clean_api_base,
-        "custom_llm_provider": "openai",
         "stream": request_stream,
         "max_tokens": body.get("max_tokens", 4096),
         "temperature": body.get("temperature", 0.7),
         "extra_body": extra_body,
         "timeout": body.get("timeout", settings.upstream_timeout_sec),
     }
+
+    # 根据上游类型设置 litellm 参数
+    if upstream_type == "anthropic":
+        # Anthropic 原生 API：litellm 用 "anthropic/model" 前缀路由
+        if not clean_real_model.startswith("anthropic/"):
+            completion_kwargs["model"] = f"anthropic/{clean_real_model}"
+        if clean_api_base:
+            completion_kwargs["api_base"] = clean_api_base
+    elif upstream_type == "gemini":
+        if not clean_real_model.startswith("gemini/"):
+            completion_kwargs["model"] = f"gemini/{clean_real_model}"
+        # Gemini 用 api_key 直接传，不需要 api_base
+    elif upstream_type == "bedrock":
+        if not clean_real_model.startswith("bedrock/"):
+            completion_kwargs["model"] = f"bedrock/{clean_real_model}"
+        # Bedrock 通过 AWS credentials 认证，不需要 api_key/api_base
+        completion_kwargs.pop("api_key", None)
+    elif upstream_type == "vertex_ai":
+        if not clean_real_model.startswith("vertex_ai/"):
+            completion_kwargs["model"] = f"vertex_ai/{clean_real_model}"
+        completion_kwargs.pop("api_key", None)
+    elif upstream_type == "azure":
+        if not clean_real_model.startswith("azure/"):
+            completion_kwargs["model"] = f"azure/{clean_real_model}"
+        completion_kwargs["api_base"] = clean_api_base
+    elif upstream_type == "ollama":
+        if not clean_real_model.startswith("ollama/"):
+            completion_kwargs["model"] = f"ollama/{clean_real_model}"
+        completion_kwargs["api_base"] = clean_api_base
+    elif upstream_type == "cohere":
+        # litellm 要求 Cohere 使用 cohere_chat/ 前缀
+        if not clean_real_model.startswith(("cohere_chat/", "cohere/")):
+            completion_kwargs["model"] = f"cohere_chat/{clean_real_model}"
+    elif upstream_type == "mistral":
+        if not clean_real_model.startswith("mistral/"):
+            completion_kwargs["model"] = f"mistral/{clean_real_model}"
+    else:
+        # openai 兼容（默认）
+        completion_kwargs["api_base"] = clean_api_base
+        completion_kwargs["custom_llm_provider"] = "openai"
 
     if body.get("top_p") is not None:
         completion_kwargs["top_p"] = body.get("top_p")
@@ -215,35 +259,36 @@ def build_completion_params(
 async def log_usage(key_id: int, model_name: str, response_data: Any, is_image: bool = False) -> None:
     """记录使用量"""
     async with AsyncSessionLocal() as session:
-        if is_image:
-            from db import UsageLog
+        try:
+            if is_image:
+                log = UsageLog(key_id=key_id, model_name=model_name, images_count=1)
+            else:
+                usage = extract_usage(response_data)
+                if (
+                    (usage["prompt_tokens"] or 0) == 0
+                    and (usage["completion_tokens"] or 0) == 0
+                    and (usage["total_tokens"] or 0) == 0
+                ):
+                    return
 
-            log = UsageLog(key_id=key_id, model_name=model_name, images_count=1)
-        else:
-            usage = extract_usage(response_data)
-            if (
-                (usage["prompt_tokens"] or 0) == 0
-                and (usage["completion_tokens"] or 0) == 0
-                and (usage["total_tokens"] or 0) == 0
-            ):
-                return
-            from db import UsageLog
+                log = UsageLog(
+                    key_id=key_id,
+                    model_name=model_name,
+                    prompt_tokens=usage["prompt_tokens"],
+                    completion_tokens=usage["completion_tokens"],
+                    total_tokens=usage["total_tokens"],
+                )
 
-            log = UsageLog(
-                key_id=key_id,
-                model_name=model_name,
-                prompt_tokens=usage["prompt_tokens"],
-                completion_tokens=usage["completion_tokens"],
-                total_tokens=usage["total_tokens"],
+            session.add(log)
+            await session.execute(
+                update(APIKey)
+                .where(APIKey.id == key_id)
+                .values(usage_count=APIKey.usage_count + 1)
             )
-
-        session.add(log)
-        await session.execute(
-            __import__("sqlalchemy", fromlist=["update"]).update(APIKey)
-            .where(APIKey.id == key_id)
-            .values(usage_count=APIKey.usage_count + 1)
-        )
-        await session.commit()
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"记录使用量失败: {e}")
 
 
 async def execute_image_generation(body: dict) -> dict:
@@ -263,15 +308,24 @@ async def execute_image_generation(body: dict) -> dict:
 
         for api_key in keys:
             try:
-                response = await litellm.aimage_generation(
-                    model=mapping.real_name,
-                    prompt=body.get("prompt"),
-                    api_key=api_key.key,
-                    api_base=provider.api_base,
-                    n=body.get("n", 1),
-                    size=body.get("size", "1024x1024"),
-                    timeout=body.get("timeout", settings.upstream_timeout_sec),
-                )
+                upstream_type = (getattr(provider, "provider_type", None) or "openai").strip().lower()
+                img_model = mapping.real_name
+                img_kwargs = {
+                    "model": img_model,
+                    "prompt": body.get("prompt"),
+                    "api_key": api_key.key,
+                    "n": body.get("n", 1),
+                    "size": body.get("size", "1024x1024"),
+                    "timeout": body.get("timeout", settings.upstream_timeout_sec),
+                }
+                if upstream_type == "openai":
+                    img_kwargs["api_base"] = provider.api_base
+                elif upstream_type == "azure":
+                    if not img_model.startswith("azure/"):
+                        img_kwargs["model"] = f"azure/{img_model}"
+                    img_kwargs["api_base"] = provider.api_base
+                # 其他类型 litellm 会根据 model 前缀自动路由
+                response = await litellm.aimage_generation(**img_kwargs)
                 await clear_key_failure(session, api_key.id)
                 await log_usage(api_key.id, model_name, response, is_image=True)
                 return response
@@ -302,3 +356,134 @@ async def execute_image_generation(body: dict) -> dict:
                 continue
 
         raise HTTPException(status_code=502, detail="All upstream keys failed for image generation.")
+
+
+async def execute_nvidia_image_generation(body: dict) -> dict:
+    """NVIDIA 专有文生图 API（SD3, FLUX 等）
+
+    NVIDIA 端点格式: POST {api_base}/v1/genai/{real_name}
+    请求体: {prompt, mode, negative_prompt, aspect_ratio, cfg_scale, steps, seed, output_format, ...}
+    响应体: {image: "base64...", ...} 或 直接返回图片二进制
+    转换为 OpenAI 格式返回: {data: [{b64_json: "..."}]}
+    """
+    model_name = body.get("model")
+    if not model_name:
+        raise HTTPException(status_code=400, detail="Missing required field: model")
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(ModelMapping, Provider).join(Provider).where(ModelMapping.virtual_name == model_name)
+        result = await session.execute(stmt)
+        mapping_data = result.first()
+
+        if not mapping_data:
+            raise HTTPException(status_code=404, detail=f"Image model {model_name} not mapped.")
+
+        mapping, provider = mapping_data
+        keys = await get_active_keys(session, provider.id)
+
+        clean_api_base = clean_config_value(provider.api_base).rstrip("/")
+        clean_real_model = clean_config_value(mapping.real_name)
+
+        # 构建 NVIDIA 专有请求体
+        nvidia_body = {
+            "prompt": body.get("prompt", ""),
+            "mode": "text-to-image",
+        }
+        # 可选参数透传
+        for key in ("negative_prompt", "aspect_ratio", "cfg_scale", "steps", "seed", "output_format", "model"):
+            if key in body and body[key] is not None:
+                nvidia_body[key] = body[key]
+        # 如果客户端用 OpenAI 格式传了 size，尝试转换为 aspect_ratio
+        if "aspect_ratio" not in nvidia_body and body.get("size"):
+            nvidia_body["aspect_ratio"] = _size_to_aspect_ratio(body["size"])
+
+        # NVIDIA 图片模型的 model 字段是简写（如 "sd3"），不是完整名
+        # 如果 real_name 包含斜杠（如 stabilityai/stable-diffusion-3-medium），用它做 URL 路径
+        # model 字段用简写或不传
+        if "/" in clean_real_model:
+            url_path = clean_real_model
+        else:
+            url_path = clean_real_model
+
+        url = f"{clean_api_base}/v1/genai/{url_path}"
+        timeout_sec = body.get("timeout", settings.upstream_timeout_sec)
+
+        # 设置输出格式默认为 jpeg（返回 base64）
+        if "output_format" not in nvidia_body:
+            nvidia_body["output_format"] = "jpeg"
+
+        # 移除不属于 NVIDIA API 的字段
+        nvidia_body.pop("model", None)
+
+        for api_key in keys:
+            clean_key = clean_config_value(api_key.key)
+            headers = {
+                "Authorization": f"Bearer {clean_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            try:
+                logger.debug(f"NVIDIA image request: {url}, key_id={api_key.id}")
+                async with httpx.AsyncClient(timeout=timeout_sec) as client:
+                    resp = await client.post(url, json=nvidia_body, headers=headers)
+
+                if resp.status_code == 200:
+                    await clear_key_failure(session, api_key.id)
+                    content_type = resp.headers.get("content-type", "")
+
+                    if "application/json" in content_type:
+                        data = resp.json()
+                        # NVIDIA 返回 {image: "base64..."} 或 {artifacts: [{base64: "..."}]}
+                        b64 = data.get("image") or ""
+                        if not b64 and isinstance(data.get("artifacts"), list):
+                            for art in data["artifacts"]:
+                                if isinstance(art, dict) and art.get("base64"):
+                                    b64 = art["base64"]
+                                    break
+                    else:
+                        # 直接返回二进制图片
+                        b64 = base64.b64encode(resp.content).decode("utf-8")
+
+                    await log_usage(api_key.id, model_name, {}, is_image=True)
+
+                    # 转换为 OpenAI 兼容格式返回
+                    return {
+                        "created": int(datetime.datetime.utcnow().timestamp()),
+                        "data": [{"b64_json": b64}] if b64 else [],
+                    }
+
+                # 错误处理
+                error_text = resp.text[:500]
+                logger.error(f"NVIDIA image key {api_key.id} failed: HTTP {resp.status_code} - {error_text}")
+
+                if resp.status_code == 429:
+                    try:
+                        await mark_key_rate_limited(session, api_key.id)
+                    except Exception as mark_err:
+                        logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
+                elif resp.status_code in (401, 403):
+                    pass  # key 无效，跳过试下一个
+
+            except Exception as e:
+                logger.error(f"NVIDIA image key {api_key.id} exception: {e}")
+                error_text = str(e).lower()
+                if any(t in error_text for t in ("timeout", "timed out", "connection")):
+                    try:
+                        await mark_key_rate_limited(session, api_key.id)
+                    except Exception:
+                        pass
+                continue
+
+        raise HTTPException(status_code=502, detail="All upstream keys failed for NVIDIA image generation.")
+
+
+def _size_to_aspect_ratio(size: str) -> str:
+    """将 OpenAI 的 size 格式 (1024x1024) 转换为 NVIDIA 的 aspect_ratio 格式 (1:1)"""
+    try:
+        w, h = size.lower().split("x")
+        w, h = int(w), int(h)
+        from math import gcd
+        g = gcd(w, h)
+        return f"{w // g}:{h // g}"
+    except Exception:
+        return "1:1"

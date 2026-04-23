@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, text
 import datetime
 import os
 import sqlite3
@@ -26,6 +26,12 @@ def ensure_sqlite_schema() -> None:
         if model_mapping_cols and "order" not in model_mapping_cols:
             cur.execute('ALTER TABLE model_mappings ADD COLUMN "order" INTEGER DEFAULT 0')
 
+        # providers.provider_type 列
+        cur.execute("PRAGMA table_info(providers)")
+        provider_cols = {row[1] for row in cur.fetchall()}
+        if provider_cols and "provider_type" not in provider_cols:
+            cur.execute("ALTER TABLE providers ADD COLUMN provider_type VARCHAR(30) DEFAULT 'openai'")
+
         # tool_default_models 表
         cur.execute(
             """
@@ -42,7 +48,11 @@ def ensure_sqlite_schema() -> None:
         conn.close()
 
 
-ensure_sqlite_schema()
+try:
+    ensure_sqlite_schema()
+except Exception as e:
+    import sys
+    print(f"[WARN] SQLite schema migration failed (non-fatal): {e}", file=sys.stderr)
 
 from sqlalchemy.pool import NullPool
 
@@ -68,11 +78,27 @@ SessionLocal = sessionmaker(sync_engine, expire_on_commit=False)
 
 Base = declarative_base()
 
+# 支持的上游供应商类型（litellm custom_llm_provider 值）
+SUPPORTED_PROVIDER_TYPES = {
+    "openai": "OpenAI 兼容（NVIDIA LLM, DeepSeek, vLLM, OneAPI 等）",
+    "anthropic": "Anthropic 原生",
+    "gemini": "Google Gemini",
+    "bedrock": "AWS Bedrock",
+    "vertex_ai": "Google Vertex AI",
+    "azure": "Azure OpenAI",
+    "ollama": "Ollama",
+    "cohere": "Cohere",
+    "mistral": "Mistral AI",
+    "nvidia_image": "NVIDIA 文生图（SD3, FLUX 等）",
+}
+
+
 class Provider(Base):
     __tablename__ = "providers"
     id = Column(Integer, primary_key=True)
     name = Column(String(50), unique=True, nullable=False)  # 例如: Nvidia, DeepSeek, OpenAI
     api_base = Column(String(255), nullable=False) # API 基础地址
+    provider_type = Column(String(30), nullable=False, default="openai")  # 上游协议类型
 
 class APIKey(Base):
     __tablename__ = "api_keys"
@@ -114,3 +140,5 @@ class ToolDefaultModel(Base):
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # 启用 WAL 模式，提升并发读写性能
+        await conn.execute(text("PRAGMA journal_mode=WAL"))
