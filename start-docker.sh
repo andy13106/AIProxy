@@ -228,6 +228,23 @@ else
     echo "✅ 使用官方源构建"
 fi
 
+ACTION="${1:-up}"
+
+if [ "$ACTION" = "logs" ]; then
+    docker compose -f "$COMPOSE_FILE" logs -f
+    exit 0
+elif [ "$ACTION" = "restart" ]; then
+    docker compose -f "$COMPOSE_FILE" restart
+    exit 0
+elif [ "$ACTION" = "stop" ]; then
+    docker compose -f "$COMPOSE_FILE" down
+    exit 0
+elif [ "$ACTION" != "up" ]; then
+    echo "❌ 不支持的参数: $ACTION"
+    echo "用法: ./start-docker.sh [up|logs|restart|stop]"
+    exit 1
+fi
+
 echo ""
 echo "🚀 正在启动 AIProxy 服务..."
 echo ""
@@ -249,23 +266,3 @@ echo "  查看日志: ./start-docker.sh logs"
 echo "  重启服务: ./start-docker.sh restart"
 echo "  停止服务: ./start-docker.sh stop"
 echo ""
-
-if [ "$1" = "logs" ]; then
-    if [ -f "docker-compose-cn.yml" ] && curl -s --connect-timeout 2 mirrors.aliyun.com > /dev/null 2>&1 && [ ! "$USE_GLOBAL_SOURCE" = "1" ]; then
-        docker compose -f docker-compose-cn.yml logs -f
-    else
-        docker compose logs -f
-    fi
-elif [ "$1" = "restart" ]; then
-    if [ -f "docker-compose-cn.yml" ] && curl -s --connect-timeout 2 mirrors.aliyun.com > /dev/null 2>&1 && [ ! "$USE_GLOBAL_SOURCE" = "1" ]; then
-        docker compose -f docker-compose-cn.yml restart
-    else
-        docker compose restart
-    fi
-elif [ "$1" = "stop" ]; then
-    if [ -f "docker-compose-cn.yml" ] && curl -s --connect-timeout 2 mirrors.aliyun.com > /dev/null 2>&1 && [ ! "$USE_GLOBAL_SOURCE" = "1" ]; then
-        docker compose -f docker-compose-cn.yml down
-    else
-        docker compose down
-    fi
-fi

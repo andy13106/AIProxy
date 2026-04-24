@@ -510,20 +510,23 @@ async def image_proxy(request: Request, auth=Depends(verify_auth)):
 
 @app.get("/props")
 @app.get("/v1/props")
-async def props_endpoint():
+async def props_endpoint(request: Request):
     """兼容 Ollama 等工具的属性探测端点"""
+    _require_api_key_for_models(request)
     return {"status": "ok", "service": "AI Proxy Gateway"}
 
 
 @app.get("/version")
-async def version_endpoint():
+async def version_endpoint(request: Request):
     """兼容 Ollama 等工具的版本探测端点"""
+    _require_api_key_for_models(request)
     return {"version": "1.0.0"}
 
 
 @app.get("/api/tags")
-async def ollama_tags_endpoint():
+async def ollama_tags_endpoint(request: Request):
     """兼容 Ollama 客户端的模型列表端点"""
+    _require_api_key_for_models(request)
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(ModelMapping.virtual_name).order_by(ModelMapping.order, ModelMapping.id))
         names = [row[0] for row in result.all() if row and row[0]]
@@ -549,6 +552,7 @@ async def ollama_tags_endpoint():
 @app.post("/api/show")
 async def ollama_show_endpoint(request: Request):
     """兼容 Ollama 客户端的模型详情探测接口"""
+    _require_api_key_for_models(request)
     body = await request.json()
     model_name = body.get("name") or body.get("model")
     if not model_name:
