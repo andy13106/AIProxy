@@ -854,27 +854,34 @@ elif menu == "模型映射管理":
         # 1. 添加表单
         with st.expander("➕ 添加新映射", expanded=False):
             p_map = {p.name: p for p in providers}
-            sel_p_name = st.selectbox("选择供应商", options=list(p_map.keys()))
+            sel_p_name = st.selectbox("选择供应商", options=list(p_map.keys()), key="add_map_provider")
             sel_p = p_map[sel_p_name]
-            
+
+            # 缓存模型列表到 session_state，避免表单内重复请求导致 selectbox 状态丢失
+            cache_key = f"add_map_models_{sel_p.id}"
             with SessionLocal() as session:
                 first_key = session.query(APIKey).filter(APIKey.provider_id == sel_p.id).first()
-            
+            if first_key:
+                if cache_key not in st.session_state or st.session_state.get(f"{cache_key}_key") != first_key.key:
+                    st.session_state[cache_key] = fetch_models(sel_p.api_base, first_key.key)
+                    st.session_state[f"{cache_key}_key"] = first_key.key
+                models = st.session_state[cache_key]
+            else:
+                models = []
+
             with st.form("add_m", clear_on_submit=True):
-                v_name = st.text_input("虚拟模型名称 (工具调用时使用)", placeholder="gpt-4o").strip()
-                
+                v_name = st.text_input("虚拟模型名称 (工具调用时使用)", placeholder="gpt-4o", key="add_map_vname").strip()
+
                 real_model = ""
-                if first_key:
-                    models = fetch_models(sel_p.api_base, first_key.key)
-                    if models:
-                        real_model = st.selectbox("选择真实模型", options=models)
-                    else:
-                        st.caption("⚠️ 无法自动获取模型列表，请手动输入")
-                        real_model = st.text_input("真实模型名称").strip()
+                if models:
+                    real_model = st.selectbox("选择真实模型", options=models, key="add_map_real_model")
+                elif first_key:
+                    st.caption("⚠️ 无法自动获取模型列表，请手动输入")
+                    real_model = st.text_input("真实模型名称", key="add_map_real_manual").strip()
                 else:
                     st.caption("⚠️ 该供应商下无 Key，请手动输入真实模型名")
-                    real_model = st.text_input("真实模型名称").strip()
-                
+                    real_model = st.text_input("真实模型名称", key="add_map_real_manual2").strip()
+
                 if st.form_submit_button("保存映射", width="stretch"):
                     if not v_name or not real_model:
                         st.error("请完整填写映射信息")
@@ -898,7 +905,11 @@ elif menu == "模型映射管理":
         # 2. 列表展示
         st.subheader("映射列表")
         mappings = get_ordered_model_mappings()
-            
+
+        # 编辑映射的 session_state 管理
+        if "edit_mapping_id" not in st.session_state:
+            st.session_state.edit_mapping_id = None
+
         if mappings:
             if HAS_SORTABLES:
                 st.caption("💡 拖拽下方条目后点击“保存拖拽顺序”，顺序将影响工具中的默认选择。")
@@ -919,17 +930,18 @@ elif menu == "模型映射管理":
                 st.info("未安装拖拽组件，当前使用 ⬆️⬇️ 排序。安装 `streamlit-sortables` 后可启用拖拽。")
                 st.caption("💡 使用 ⬆️⬇️ 按钮调整模型顺序，顺序将影响工具中的默认选择")
 
-            h1, h2, h3, h4, h5, h6 = st.columns([1, 3, 5, 2, 2, 1])
+            h1, h2, h3, h4, h5, h6, h7 = st.columns([1, 3, 5, 2, 2, 1, 1])
             h1.write("**#**")
             h2.write("**虚拟名称**")
             h3.write("**真实模型**")
             h4.write("**供应商**")
             h5.write("**排序**")
-            h6.write("**删除**")
+            h6.write("**编辑**")
+            h7.write("**删除**")
             st.divider()
 
             for idx, (m, p) in enumerate(mappings):
-                c1, c2, c3, c4, c5, c6 = st.columns([1, 3, 5, 2, 2, 1])
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([1, 3, 5, 2, 2, 1, 1])
                 c1.write(f"{idx + 1}")
                 c2.write(f"**{m.virtual_name}**")
                 c3.write(f"`{m.real_name}`")
@@ -946,9 +958,83 @@ elif menu == "模型映射管理":
                     if btn_down and idx < len(mappings) - 1:
                         move_model_mapping(m.id, "down")
                         st.rerun()
-                if c6.button("🗑️", key=f"del_m_{m.id}"):
+                if c6.button("✏️", key=f"edit_m_{m.id}"):
+                    st.session_state.edit_mapping_id = m.id
+                    st.rerun()
+                if c7.button("🗑️", key=f"del_m_{m.id}"):
                     if delete_item(ModelMapping, m.id, "模型映射已删除"):
                         st.rerun()
+
+            # 编辑映射表单
+            edit_id = st.session_state.edit_mapping_id
+            if edit_id is not None:
+                with st.expander("✏️ 编辑映射", expanded=True):
+                    with SessionLocal() as session:
+                        edit_m = session.query(ModelMapping).filter(ModelMapping.id == edit_id).first()
+                        if edit_m:
+                            edit_providers = session.query(Provider).all()
+                            edit_p_map = {p.name: p for p in edit_providers}
+                            # 找到当前映射的供应商名
+                            edit_provider_obj = session.query(Provider).filter(Provider.id == edit_m.provider_id).first()
+                            current_p_name = edit_provider_obj.name if edit_provider_obj else list(edit_p_map.keys())[0]
+
+                            edit_p_name = st.selectbox("供应商", options=list(edit_p_map.keys()),
+                                                        index=list(edit_p_map.keys()).index(current_p_name),
+                                                        key="edit_map_provider")
+                            edit_p = edit_p_map[edit_p_name]
+
+                            # 缓存编辑表单的模型列表
+                            edit_cache_key = f"edit_map_models_{edit_p.id}"
+                            edit_first_key = session.query(APIKey).filter(APIKey.provider_id == edit_p.id).first()
+                            if edit_first_key:
+                                if edit_cache_key not in st.session_state or st.session_state.get(f"{edit_cache_key}_key") != edit_first_key.key:
+                                    st.session_state[edit_cache_key] = fetch_models(edit_p.api_base, edit_first_key.key)
+                                    st.session_state[f"{edit_cache_key}_key"] = edit_first_key.key
+                                edit_models = st.session_state[edit_cache_key]
+                            else:
+                                edit_models = []
+
+                            with st.form("edit_m_form"):
+                                ev_name = st.text_input("虚拟模型名称", value=edit_m.virtual_name, key="edit_map_vname", disabled=True)
+                                st.caption("虚拟名称为映射唯一标识，不可修改。如需更改请删除后重新添加。")
+
+                                edit_real_model = ""
+                                if edit_models:
+                                    # 尝试将当前 real_name 设为默认选中
+                                    default_idx = 0
+                                    if edit_m.real_name in edit_models:
+                                        default_idx = edit_models.index(edit_m.real_name)
+                                    edit_real_model = st.selectbox("选择真实模型", options=edit_models,
+                                                                    index=default_idx, key="edit_map_real_model")
+                                elif edit_first_key:
+                                    st.caption("⚠️ 无法自动获取模型列表，请手动输入")
+                                    edit_real_model = st.text_input("真实模型名称", value=edit_m.real_name, key="edit_map_real_manual").strip()
+                                else:
+                                    st.caption("⚠️ 该供应商下无 Key，请手动输入真实模型名")
+                                    edit_real_model = st.text_input("真实模型名称", value=edit_m.real_name, key="edit_map_real_manual2").strip()
+
+                                save_col, cancel_col = st.columns(2)
+                                saved = save_col.form_submit_button("💾 保存修改", width="stretch", type="primary")
+                                cancelled = cancel_col.form_submit_button("取消", width="stretch")
+
+                                if saved:
+                                    if not edit_real_model:
+                                        st.error("请填写真实模型名称")
+                                    else:
+                                        edit_m.real_name = edit_real_model
+                                        edit_m.provider_id = edit_p.id
+                                        session.commit()
+                                        st.session_state.edit_mapping_id = None
+                                        st.toast(f"映射已更新: {edit_m.virtual_name} -> {edit_real_model}")
+                                        st.rerun()
+
+                                if cancelled:
+                                    st.session_state.edit_mapping_id = None
+                                    st.rerun()
+                        else:
+                            st.warning("映射不存在，可能已被删除")
+                            st.session_state.edit_mapping_id = None
+                            st.rerun()
         else:
             st.info("尚未配置模型映射")
 
