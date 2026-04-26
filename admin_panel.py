@@ -10,11 +10,6 @@ import os
 import json
 import base64
 import socket
-try:
-    from streamlit_sortables import sort_items
-    HAS_SORTABLES = True
-except Exception:
-    HAS_SORTABLES = False
 
 from config_assistant.env_detector import is_running_in_docker
 from config_assistant.config_detector import ConfigDetector
@@ -892,70 +887,44 @@ elif menu == "模型映射管理":
                                 st.rerun()
 
         # 2. 列表展示与排序
-        st.subheader("映射列表（可拖拽排序）")
+        st.subheader("映射列表")
         mappings = get_ordered_model_mappings()
 
         # 编辑映射的 session_state 管理
         if "edit_mapping_id" not in st.session_state:
             st.session_state.edit_mapping_id = None
-        # 用于检测拖拽顺序变化的 session_state
-        if "last_mapping_order" not in st.session_state:
-            st.session_state.last_mapping_order = None
 
         if mappings:
-            if HAS_SORTABLES:
-                st.caption("💡 拖拽列表项调整顺序，松开后自动保存。顺序将影响工具中的默认选择。")
-                drag_items = [
-                    f"{m.id} · {m.virtual_name} -> {m.real_name} ({p.name})"
-                    for m, p in mappings
-                ]
-                original_order = [m.id for m, p in mappings]
-                sorted_items = sort_items(drag_items, direction="vertical")
-                try:
-                    current_order = [int(item.split(" · ", 1)[0]) for item in sorted_items]
-                    # 检测顺序变化并自动保存
-                    if original_order != current_order:
-                        if st.session_state.last_mapping_order != current_order:
-                            if apply_model_order(current_order):
-                                st.session_state.last_mapping_order = current_order
-                                st.toast("✅ 模型顺序已自动保存", icon="💾")
-                                st.rerun()
-                except Exception as e:
-                    st.error(f"处理顺序时出错: {e}")
-            else:
-                st.info("未安装拖拽组件，当前使用 ⬆️⬇️ 排序。安装 `streamlit-sortables` 后可启用拖拽。")
-                st.caption("💡 使用 ⬆️⬇️ 按钮调整模型顺序，顺序将影响工具中的默认选择")
+            st.caption("💡 使用 ⬆️⬇️ 按钮调整模型顺序，顺序将影响工具中的默认选择。点击编辑或删除按钮进行相应操作。")
 
-            h1, h2, h3, h4, h5, h6 = st.columns([1, 3, 5, 2, 1, 1])
+            h1, h2, h3, h4, h5, h6, h7 = st.columns([0.5, 1, 3, 5, 2, 1, 1])
             h1.write("**#**")
-            h2.write("**虚拟名称**")
-            h3.write("**真实模型**")
-            h4.write("**供应商**")
-            h5.write("**编辑**")
-            h6.write("**删除**")
+            h2.write("**排序**")
+            h3.write("**虚拟名称**")
+            h4.write("**真实模型**")
+            h5.write("**供应商**")
+            h6.write("**编辑**")
+            h7.write("**删除**")
             st.divider()
 
             for idx, (m, p) in enumerate(mappings):
-                c1, c2, c3, c4, c5, c6 = st.columns([1, 3, 5, 2, 1, 1])
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([0.5, 1, 3, 5, 2, 1, 1])
                 c1.write(f"{idx + 1}")
-                c2.write(f"**{m.virtual_name}**")
-                c3.write(f"`{m.real_name}`")
-                c4.write(p.name)
-                if not HAS_SORTABLES:
-                    # 上下移动按钮（拖拽组件不可用时的后备方案）
-                    btn_col = st.container()
-                    with btn_col:
-                        btn_up, btn_down = c1.columns(2)
-                        if btn_up.button("⬆️", key=f"up_m_{m.id}", disabled=(idx == 0)):
-                            move_model_mapping(m.id, "up")
-                            st.rerun()
-                        if btn_down.button("⬇️", key=f"down_m_{m.id}", disabled=(idx == len(mappings) - 1)):
-                            move_model_mapping(m.id, "down")
-                            st.rerun()
-                if c5.button("✏️", key=f"edit_m_{m.id}"):
+                # 排序按钮（始终显示）
+                btn_up, btn_down = c2.columns(2)
+                if btn_up.button("⬆️", key=f"up_m_{m.id}", disabled=(idx == 0)):
+                    move_model_mapping(m.id, "up")
+                    st.rerun()
+                if btn_down.button("⬇️", key=f"down_m_{m.id}", disabled=(idx == len(mappings) - 1)):
+                    move_model_mapping(m.id, "down")
+                    st.rerun()
+                c3.write(f"**{m.virtual_name}**")
+                c4.write(f"`{m.real_name}`")
+                c5.write(p.name)
+                if c6.button("✏️", key=f"edit_m_{m.id}"):
                     st.session_state.edit_mapping_id = m.id
                     st.rerun()
-                if c6.button("🗑️", key=f"del_m_{m.id}"):
+                if c7.button("🗑️", key=f"del_m_{m.id}"):
                     if delete_item(ModelMapping, m.id, "模型映射已删除"):
                         st.rerun()
 
