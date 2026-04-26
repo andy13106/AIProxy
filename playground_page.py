@@ -26,7 +26,7 @@ def render_playground_page():
             if key:
                 provider_to_key[p.name] = (p, key)
 
-        if not provider_to_key:
+        if provider_to_key:
             provider_names = list(provider_to_key.keys())
             selected_provider_name = st.selectbox("选择供应商", options=provider_names)
             selected_provider, selected_key = provider_to_key[selected_provider_name]
