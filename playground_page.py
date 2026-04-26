@@ -5,20 +5,32 @@ import datetime
 import requests
 import json
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+
+executor = ThreadPoolExecutor(max_workers=10)
 
 
 def render_playground_page():
     st.markdown("""
     <style>
-    .main-chat-container {
-        height: calc(100vh - 200px);
+    .main-container {
         display: flex;
         flex-direction: column;
+        height: calc(100vh - 120px);
     }
-    .chat-messages-container {
+    .chat-container {
         flex: 1;
         overflow-y: auto;
         padding-right: 10px;
+        margin-bottom: 20px;
+    }
+    .input-area {
+        background-color: #FAFAFA;
+        border-top: 1px solid #E0E0E0;
+        padding: 16px;
+        border-radius: 8px;
     }
     .user-message-container {
         display: flex;
@@ -46,6 +58,21 @@ def render_playground_page():
         border-radius: 18px;
         border-bottom-left-radius: 4px;
         word-wrap: break-word;
+    }
+    .error-message-container {
+        display: flex;
+        justify-content: flex-start;
+        margin-bottom: 16px;
+    }
+    .error-message {
+        max-width: 100%;
+        background-color: #FFE4E1;
+        color: #DC3545;
+        padding: 12px 16px;
+        border-radius: 18px;
+        border-bottom-left-radius: 4px;
+        word-wrap: break-word;
+        border: 1px solid #F5C6CB;
     }
     .code-block-container {
         position: relative;
@@ -134,11 +161,13 @@ def render_playground_page():
     .delete-button:hover {
         background-color: #FFE4E1;
     }
-    .model-selector {
-        display: flex;
-        gap: 10px;
-        align-items: center;
-        margin-bottom: 20px;
+    .streaming-indicator {
+        display: inline-block;
+        animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
     }
     </style>
     """, unsafe_allow_html=True)
@@ -151,6 +180,12 @@ def render_playground_page():
         st.session_state.chat_sessions = {}
     if "current_session_id" not in st.session_state:
         st.session_state.current_session_id = None
+    if "input_history" not in st.session_state:
+        st.session_state.input_history = []
+    if "input_history_index" not in st.session_state:
+        st.session_state.input_history_index = -1
+    if "streaming_sessions" not in st.session_state:
+        st.session_state.streaming_sessions = {}
     if "sidebar_collapsed" not in st.session_state:
         st.session_state.sidebar_collapsed = False
 
@@ -182,7 +217,9 @@ def render_playground_page():
                             "provider": provider_names[0] if provider_names else None,
                             "model": None,
                             "title": "新对话",
-                            "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            "is_streaming": False,
+                            "streaming_content": ""
                         }
                         st.session_state.current_session_id = new_session_id
                         st.rerun()
@@ -193,11 +230,15 @@ def render_playground_page():
                     for session_id in reversed(st.session_state.chat_sessions.keys()):
                         session_data = st.session_state.chat_sessions[session_id]
                         is_active = st.session_state.current_session_id == session_id
+                        is_streaming = session_data.get("is_streaming", False)
                         
                         col1, col2 = st.columns([4, 1])
                         with col1:
+                            button_label = f"💬 {session_data['title']}"
+                            if is_streaming:
+                                button_label += " 🔄"
                             if st.button(
-                                f"💬 {session_data['title']}",
+                                button_label,
                                 key=f"load_{session_id}",
                                 use_container_width=True,
                                 type="primary" if is_active else "secondary"
@@ -206,6 +247,8 @@ def render_playground_page():
                                 st.rerun()
                         with col2:
                             if st.button("🗑️", key=f"delete_{session_id}"):
+                                if session_id in st.session_state.streaming_sessions:
+                                    del st.session_state.streaming_sessions[session_id]
                                 del st.session_state.chat_sessions[session_id]
                                 if st.session_state.current_session_id == session_id:
                                     if st.session_state.chat_sessions:
@@ -226,50 +269,108 @@ def render_playground_page():
                         "provider": provider_names[0] if provider_names else None,
                         "model": None,
                         "title": "新对话",
-                        "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        "is_streaming": False,
+                        "streaming_content": ""
                     }
                     st.session_state.current_session_id = new_session_id
 
             current_session = st.session_state.chat_sessions[st.session_state.current_session_id]
             
-            st.markdown(f"### {current_session['title']}")
+            st.markdown(f"""
+            <div style="margin-bottom: 10px;">
+                <h3 style="margin: 0; padding: 0;">{current_session['title']}</h3>
+            </div>
+            """, unsafe_allow_html=True)
             
-            provider_col, model_col = st.columns([1, 1])
-            with provider_col:
-                selected_provider_name = st.selectbox(
-                    "选择供应商",
-                    options=provider_names,
-                    key="selected_provider",
-                    index=provider_names.index(current_session["provider"]) if current_session["provider"] in provider_names else 0
-                )
-                if selected_provider_name != current_session["provider"]:
-                    current_session["provider"] = selected_provider_name
-                    current_session["model"] = None
+            def render_message(msg):
+                if msg["role"] == "user":
+                    st.markdown(f"""
+                    <div class="user-message-container">
+                        <div class="user-message">{msg['content']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                elif msg["role"] == "assistant":
+                    content = msg['content']
+                    thinking_content = None
+                    thinking_pattern = r'<thinking>([\s\S]*?)</thinking>'
+                    thinking_match = re.search(thinking_pattern, content)
+                    if thinking_match:
+                        thinking_content = thinking_match.group(1).strip()
+                        content = content[thinking_match.end():].strip()
+                    
+                    final_html = ""
+                    if thinking_content:
+                        thinking_id = f"thinking_{id(thinking_content)}"
+                        final_html += f"""
+                        <div class="thinking-block">
+                            <div class="thinking-header" onclick="
+                                var content = document.getElementById('{thinking_id}');
+                                if (content.classList.contains('collapsed')) {{
+                                    content.classList.remove('collapsed');
+                                }} else {{
+                                    content.classList.add('collapsed');
+                                }}
+                            ">
+                                <span>🤔 思考过程</span>
+                                <span>▼</span>
+                            </div>
+                            <div id="{thinking_id}" class="thinking-content collapsed">
+                                <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{thinking_content}</pre>
+                            </div>
+                        </div>
+                        """
+                    
+                    parts = re.split(r'(```[\s\S]*?```)', content)
+                    for part in parts:
+                        if part.startswith('```') and part.endswith('```'):
+                            code_content = part[3:-3].strip()
+                            first_line_end = code_content.find('\n')
+                            if first_line_end > 0:
+                                language = code_content[:first_line_end].strip()
+                                actual_code = code_content[first_line_end+1:]
+                            else:
+                                language = "code"
+                                actual_code = code_content
+                            
+                            code_id = f"code_{id(actual_code)}"
+                            final_html += f"""
+                            <div class="code-block-container">
+                                <div class="code-block-header">
+                                    <span>{language}</span>
+                                    <button class="copy-button" onclick="
+                                        var codeElement = document.getElementById('{code_id}');
+                                        var range = document.createRange();
+                                        range.selectNode(codeElement);
+                                        window.getSelection().removeAllRanges();
+                                        window.getSelection().addRange(range);
+                                        document.execCommand('copy');
+                                        window.getSelection().removeAllRanges();
+                                        this.textContent = '已复制!';
+                                        setTimeout(() => {{ this.textContent = '复制'; }}, 2000);
+                                    ">复制</button>
+                                </div>
+                                <div class="code-block-content">
+                                    <pre id="{code_id}" style="margin: 0; white-space: pre-wrap;">{actual_code}</pre>
+                                </div>
+                            </div>
+                            """
+                        else:
+                            if part.strip():
+                                final_html += f"<p style='margin: 8px 0; white-space: pre-wrap;'>{part}</p>"
+                    
+                    st.markdown(f"""
+                    <div class="assistant-message-container">
+                        <div class="assistant-message">{final_html}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                elif msg["role"] == "error":
+                    st.markdown(f"""
+                    <div class="error-message-container">
+                        <div class="error-message">❌ {msg['content']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-            selected_provider, selected_key = provider_to_key[selected_provider_name]
-            
-            cache_key = f"provider_models_{selected_provider.id}"
-            if cache_key not in st.session_state:
-                st.session_state[cache_key] = fetch_models(selected_provider.api_base, selected_key.key)
-            
-            provider_models = st.session_state[cache_key]
-            text_models = [m for m in provider_models if classify_model_type(m) == "text"]
-            
-            with model_col:
-                if text_models:
-                    selected_model = st.selectbox(
-                        "选择模型",
-                        options=text_models,
-                        key="selected_model",
-                        index=text_models.index(current_session["model"]) if current_session["model"] in text_models else 0
-                    )
-                    current_session["model"] = selected_model
-                else:
-                    st.warning("未获取到文本模型列表。")
-                    selected_model = None
-
-            st.markdown("---")
-            
             chat_container = st.container()
             with chat_container:
                 if not current_session["messages"]:
@@ -281,127 +382,136 @@ def render_playground_page():
                     """, unsafe_allow_html=True)
                 else:
                     for msg in current_session["messages"]:
-                        if msg["role"] == "user":
-                            st.markdown(f"""
-                            <div class="user-message-container">
-                                <div class="user-message">{msg['content']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-                        elif msg["role"] == "assistant":
-                            content = msg['content']
-                            thinking_content = None
-                            thinking_pattern = r'<thinking>([\s\S]*?)</thinking>'
-                            thinking_match = re.search(thinking_pattern, content)
-                            if thinking_match:
-                                thinking_content = thinking_match.group(1).strip()
-                                content = content[thinking_match.end():].strip()
-                            
-                            final_html = ""
-                            if thinking_content:
-                                thinking_id = f"thinking_{id(thinking_content)}"
-                                final_html += f"""
-                                <div class="thinking-block">
-                                    <div class="thinking-header" onclick="
-                                        var content = document.getElementById('{thinking_id}');
-                                        if (content.classList.contains('collapsed')) {{
-                                            content.classList.remove('collapsed');
-                                        }} else {{
-                                            content.classList.add('collapsed');
-                                        }}
-                                    ">
-                                        <span>🤔 思考过程</span>
-                                        <span>▼</span>
-                                    </div>
-                                    <div id="{thinking_id}" class="thinking-content collapsed">
-                                        <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{thinking_content}</pre>
-                                    </div>
+                        render_message(msg)
+                    
+                    if current_session.get("is_streaming", False) and current_session.get("streaming_content", ""):
+                        streaming_content = current_session["streaming_content"]
+                        thinking_content = None
+                        thinking_pattern = r'<thinking>([\s\S]*?)</thinking>'
+                        thinking_match = re.search(thinking_pattern, streaming_content)
+                        if thinking_match:
+                            thinking_content = thinking_match.group(1).strip()
+                            remaining_content = streaming_content[thinking_match.end():].strip()
+                        else:
+                            remaining_content = streaming_content
+                        
+                        final_html = ""
+                        if thinking_content:
+                            thinking_id = f"streaming_thinking_{id(streaming_content)}"
+                            final_html += f"""
+                            <div class="thinking-block">
+                                <div class="thinking-header" onclick="
+                                    var content = document.getElementById('{thinking_id}');
+                                    if (content.classList.contains('collapsed')) {{
+                                        content.classList.remove('collapsed');
+                                    }} else {{
+                                        content.classList.add('collapsed');
+                                    }}
+                                ">
+                                    <span>🤔 思考过程</span>
+                                    <span>▼</span>
                                 </div>
-                                """
-                            
-                            parts = re.split(r'(```[\s\S]*?```)', content)
-                            for part in parts:
-                                if part.startswith('```') and part.endswith('```'):
-                                    code_content = part[3:-3].strip()
-                                    first_line_end = code_content.find('\n')
-                                    if first_line_end > 0:
-                                        language = code_content[:first_line_end].strip()
-                                        actual_code = code_content[first_line_end+1:]
-                                    else:
-                                        language = "code"
-                                        actual_code = code_content
-                                    
-                                    code_id = f"code_{id(actual_code)}"
-                                    final_html += f"""
-                                    <div class="code-block-container">
-                                        <div class="code-block-header">
-                                            <span>{language}</span>
-                                            <button class="copy-button" onclick="
-                                                var codeElement = document.getElementById('{code_id}');
-                                                var range = document.createRange();
-                                                range.selectNode(codeElement);
-                                                window.getSelection().removeAllRanges();
-                                                window.getSelection().addRange(range);
-                                                document.execCommand('copy');
-                                                window.getSelection().removeAllRanges();
-                                                this.textContent = '已复制!';
-                                                setTimeout(() => {{ this.textContent = '复制'; }}, 2000);
-                                            ">复制</button>
-                                        </div>
-                                        <div class="code-block-content">
-                                            <pre id="{code_id}" style="margin: 0; white-space: pre-wrap;">{actual_code}</pre>
-                                        </div>
-                                    </div>
-                                    """
-                                else:
-                                    if part.strip():
-                                        final_html += f"<p style='margin: 8px 0; white-space: pre-wrap;'>{part}</p>"
-                            
-                            st.markdown(f"""
-                            <div class="assistant-message-container">
-                                <div class="assistant-message">{final_html}</div>
+                                <div id="{thinking_id}" class="thinking-content">
+                                    <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{thinking_content}</pre>
+                                </div>
                             </div>
-                            """, unsafe_allow_html=True)
+                            """
+                        
+                        if remaining_content:
+                            final_html += f"<p style='margin: 8px 0; white-space: pre-wrap;'>{remaining_content}<span class='streaming-indicator'>▌</span></p>"
+                        
+                        st.markdown(f"""
+                        <div class="assistant-message-container">
+                            <div class="assistant-message">{final_html}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
 
             st.markdown("---")
             
-            user_input = st.chat_input("输入消息并回车发送...", key="main_chat_input")
-            
-            if user_input:
-                if not selected_model:
-                    st.error("请先选择一个模型。")
-                else:
+            with st.container():
+                st.markdown('<div class="input-area">', unsafe_allow_html=True)
+                
+                provider_col, model_col = st.columns([1, 1])
+                with provider_col:
+                    selected_provider_name = st.selectbox(
+                        "选择供应商",
+                        options=provider_names,
+                        key="selected_provider",
+                        index=provider_names.index(current_session["provider"]) if current_session["provider"] in provider_names else 0
+                    )
+                    if selected_provider_name != current_session["provider"]:
+                        current_session["provider"] = selected_provider_name
+                        current_session["model"] = None
+
+                selected_provider, selected_key = provider_to_key[selected_provider_name]
+                
+                cache_key = f"provider_models_{selected_provider.id}"
+                if cache_key not in st.session_state:
+                    st.session_state[cache_key] = fetch_models(selected_provider.api_base, selected_key.key)
+                
+                provider_models = st.session_state[cache_key]
+                text_models = [m for m in provider_models if classify_model_type(m) == "text"]
+                
+                with model_col:
+                    if text_models:
+                        selected_model = st.selectbox(
+                            "选择模型",
+                            options=text_models,
+                            key="selected_model",
+                            index=text_models.index(current_session["model"]) if current_session["model"] in text_models else 0
+                        )
+                        current_session["model"] = selected_model
+                    else:
+                        st.warning("未获取到文本模型列表。")
+                        selected_model = None
+
+                def send_message(user_input):
+                    if not selected_model:
+                        st.error("请先选择一个模型。")
+                        return
+                    
+                    if user_input:
+                        if user_input not in st.session_state.input_history:
+                            st.session_state.input_history.append(user_input)
+                        st.session_state.input_history_index = -1
+                    
                     if not current_session["messages"]:
                         current_session["title"] = user_input[:30] + ("..." if len(user_input) > 30 else "")
                     
                     current_session["messages"].append({"role": "user", "content": user_input})
                     
-                    url = f"{selected_provider.api_base.rstrip('/')}/chat/completions"
-                    headers = {
-                        "Authorization": f"Bearer {selected_key.key}",
-                        "Content-Type": "application/json",
-                    }
+                    current_session["is_streaming"] = True
+                    current_session["streaming_content"] = ""
                     
-                    _send_messages = []
-                    _send_messages.extend(current_session["messages"])
-                    
-                    payload = {
-                        "model": selected_model,
-                        "messages": _send_messages,
-                        "max_tokens": 4096,
-                        "temperature": 0.7,
-                        "stream": True,
-                    }
-                    
-                    try:
-                        resp = requests.post(url, headers=headers, json=payload, timeout=120, stream=True)
-                        if resp.status_code == 200:
-                            collected_text = []
-                            usage_data = {}
+                    def stream_response():
+                        try:
+                            url = f"{selected_provider.api_base.rstrip('/')}/chat/completions"
+                            headers = {
+                                "Authorization": f"Bearer {selected_key.key}",
+                                "Content-Type": "application/json",
+                            }
                             
-                            with st.chat_message("assistant"):
-                                placeholder = st.empty()
+                            _send_messages = []
+                            _send_messages.extend(current_session["messages"][:-1])
+                            _send_messages.append({"role": "user", "content": user_input})
+                            
+                            payload = {
+                                "model": selected_model,
+                                "messages": _send_messages,
+                                "max_tokens": 4096,
+                                "temperature": 0.7,
+                                "stream": True,
+                            }
+                            
+                            resp = requests.post(url, headers=headers, json=payload, timeout=120, stream=True)
+                            if resp.status_code == 200:
+                                collected_text = []
+                                usage_data = {}
                                 
                                 for line in resp.iter_lines(decode_unicode=True):
+                                    if not current_session.get("is_streaming", False):
+                                        break
+                                    
                                     if not line or not line.startswith("data: "):
                                         continue
                                     data_str = line[6:]
@@ -413,30 +523,49 @@ def render_playground_page():
                                         content_piece = delta.get("content") or ""
                                         if content_piece:
                                             collected_text.append(content_piece)
-                                            placeholder.markdown("".join(collected_text) + "▌")
+                                            current_session["streaming_content"] = "".join(collected_text)
                                         if chunk.get("usage"):
                                             usage_data = chunk["usage"]
                                     except (json.JSONDecodeError, Exception):
                                         continue
                                 
                                 final_text = "".join(collected_text) or "(空响应)"
-                                placeholder.markdown(final_text)
-                            
-                            current_session["messages"].append({"role": "assistant", "content": final_text})
-                            
-                            ptk = (usage_data.get("prompt_tokens") or 0)
-                            ctk = (usage_data.get("completion_tokens") or 0)
-                            ttk = (usage_data.get("total_tokens") or (ptk + ctk))
-                            log_custom_usage(
-                                key_id=selected_key.id,
-                                model_name=selected_model,
-                                prompt_tokens=ptk,
-                                completion_tokens=ctk,
-                                total_tokens=ttk,
-                            )
-                            
-                            st.rerun()
-                        else:
-                            st.error(f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}")
-                    except Exception as e:
-                        st.error(f"请求异常：{e}")
+                                current_session["messages"].append({"role": "assistant", "content": final_text})
+                                
+                                ptk = (usage_data.get("prompt_tokens") or 0)
+                                ctk = (usage_data.get("completion_tokens") or 0)
+                                ttk = (usage_data.get("total_tokens") or (ptk + ctk))
+                                log_custom_usage(
+                                    key_id=selected_key.id,
+                                    model_name=selected_model,
+                                    prompt_tokens=ptk,
+                                    completion_tokens=ctk,
+                                    total_tokens=ttk,
+                                )
+                            else:
+                                error_msg = f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}"
+                                current_session["messages"].append({"role": "error", "content": error_msg})
+                        except Exception as e:
+                            error_msg = f"请求异常：{str(e)}"
+                            current_session["messages"].append({"role": "error", "content": error_msg})
+                        finally:
+                            current_session["is_streaming"] = False
+                            current_session["streaming_content"] = ""
+                    
+                    session_id = st.session_state.current_session_id
+                    st.session_state.streaming_sessions[session_id] = executor.submit(stream_response)
+                    
+                    st.rerun()
+
+                user_input = st.chat_input("输入消息并回车发送...", key="main_chat_input")
+                
+                if user_input:
+                    if current_session.get("is_streaming", False):
+                        st.warning("请等待当前回复完成后再发送新消息。")
+                    else:
+                        send_message(user_input)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            if current_session.get("is_streaming", False):
+                st.empty()
