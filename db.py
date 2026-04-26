@@ -1,6 +1,19 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, text
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Float,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Text,
+    text,
+    Index,
+    UniqueConstraint,
+)
 import datetime
 import os
 import sqlite3
@@ -42,6 +55,43 @@ def ensure_sqlite_schema() -> None:
                 updated_at DATETIME
             )
             """
+        )
+
+        # playground_chat_sessions 表
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS playground_chat_sessions (
+                id INTEGER PRIMARY KEY,
+                session_uid VARCHAR(80) UNIQUE NOT NULL,
+                title VARCHAR(200) NOT NULL,
+                provider_name VARCHAR(100),
+                model_name VARCHAR(200),
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+
+        # playground_chat_messages 表
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS playground_chat_messages (
+                id INTEGER PRIMARY KEY,
+                session_uid VARCHAR(80) NOT NULL,
+                seq INTEGER NOT NULL,
+                role VARCHAR(20) NOT NULL,
+                content TEXT,
+                created_at DATETIME
+            )
+            """
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_playground_chat_messages_session_seq "
+            "ON playground_chat_messages(session_uid, seq)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_playground_chat_messages_session_uid "
+            "ON playground_chat_messages(session_uid)"
         )
         conn.commit()
     finally:
@@ -136,6 +186,32 @@ class ToolDefaultModel(Base):
     tool_id = Column(String(50), unique=True, nullable=False)  # 工具 ID，如 "claude_code", "opencode" 等
     default_model = Column(String(100), nullable=False)  # 默认模型名称
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class PlaygroundChatSession(Base):
+    __tablename__ = "playground_chat_sessions"
+    id = Column(Integer, primary_key=True)
+    session_uid = Column(String(80), unique=True, nullable=False, index=True)
+    title = Column(String(200), nullable=False, default="新对话")
+    provider_name = Column(String(100), nullable=True)
+    model_name = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class PlaygroundChatMessage(Base):
+    __tablename__ = "playground_chat_messages"
+    __table_args__ = (
+        UniqueConstraint("session_uid", "seq", name="ux_playground_chat_messages_session_seq"),
+        Index("ix_playground_chat_messages_session_uid", "session_uid"),
+    )
+    id = Column(Integer, primary_key=True)
+    session_uid = Column(String(80), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=True, default="")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
 
 async def init_db():
     async with engine.begin() as conn:

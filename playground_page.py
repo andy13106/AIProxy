@@ -1,571 +1,759 @@
-import streamlit as st
-from db import SessionLocal, Provider, APIKey
-from utils import fetch_models, classify_model_type, log_custom_usage
 import datetime
-import requests
+import html
 import json
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+import requests
+import streamlit as st
+
+from db import (
+    APIKey,
+    PlaygroundChatMessage,
+    PlaygroundChatSession,
+    Provider,
+    SessionLocal,
+)
+from utils import classify_model_type, fetch_models, log_custom_usage
 
 
-executor = ThreadPoolExecutor(max_workers=10)
+_WORKER_LOCK = threading.Lock()
+_WORKER_THREADS: dict[str, threading.Thread] = {}
 
 
-def render_playground_page():
-    st.markdown("""
-    <style>
-    .main-container {
-        display: flex;
-        flex-direction: column;
-        height: calc(100vh - 120px);
-    }
-    .chat-container {
-        flex: 1;
-        overflow-y: auto;
-        padding-right: 10px;
-        margin-bottom: 20px;
-    }
-    .input-area {
-        background-color: #FAFAFA;
-        border-top: 1px solid #E0E0E0;
-        padding: 16px;
-        border-radius: 8px;
-    }
-    .user-message-container {
-        display: flex;
-        justify-content: flex-end;
-        margin-bottom: 16px;
-    }
-    .user-message {
-        max-width: 70%;
-        background-color: #007AFF;
-        color: white;
-        padding: 12px 16px;
-        border-radius: 18px;
-        border-bottom-right-radius: 4px;
-        word-wrap: break-word;
-    }
-    .assistant-message-container {
-        display: flex;
-        justify-content: flex-start;
-        margin-bottom: 16px;
-    }
-    .assistant-message {
-        max-width: 100%;
-        background-color: #F0F0F0;
-        padding: 12px 16px;
-        border-radius: 18px;
-        border-bottom-left-radius: 4px;
-        word-wrap: break-word;
-    }
-    .error-message-container {
-        display: flex;
-        justify-content: flex-start;
-        margin-bottom: 16px;
-    }
-    .error-message {
-        max-width: 100%;
-        background-color: #FFE4E1;
-        color: #DC3545;
-        padding: 12px 16px;
-        border-radius: 18px;
-        border-bottom-left-radius: 4px;
-        word-wrap: break-word;
-        border: 1px solid #F5C6CB;
-    }
-    .code-block-container {
-        position: relative;
-        background-color: #1E1E1E;
-        border-radius: 8px;
-        margin: 8px 0;
-        overflow: hidden;
-    }
-    .code-block-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background-color: #2D2D2D;
-        padding: 4px 12px;
-        font-size: 12px;
-        color: #858585;
-    }
-    .code-block-content {
-        padding: 12px;
-        overflow-x: auto;
-        font-family: 'Courier New', monospace;
-        font-size: 14px;
-        line-height: 1.5;
-        color: #D4D4D4;
-    }
-    .copy-button {
-        background-color: transparent;
-        border: 1px solid #404040;
-        color: #858585;
-        padding: 2px 8px;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 12px;
-    }
-    .copy-button:hover {
-        background-color: #404040;
-        color: #D4D4D4;
-    }
-    .thinking-block {
-        background-color: #FFF9E6;
-        border-left: 3px solid #FFD700;
-        border-radius: 4px;
-        margin: 8px 0;
-        overflow: hidden;
-    }
-    .thinking-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 8px 12px;
-        background-color: #FFF3CC;
-        cursor: pointer;
-        font-weight: 500;
-    }
-    .thinking-content {
-        padding: 12px;
-        display: block;
-    }
-    .thinking-content.collapsed {
-        display: none;
-    }
-    .sidebar-history-item {
-        padding: 10px;
-        border-radius: 8px;
-        margin-bottom: 8px;
-        cursor: pointer;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .sidebar-history-item:hover {
-        background-color: #F0F0F0;
-    }
-    .sidebar-history-item.active {
-        background-color: #E0E0E0;
-    }
-    .delete-button {
-        background-color: transparent;
-        border: none;
-        color: #FF4500;
-        cursor: pointer;
-        padding: 2px 6px;
-        border-radius: 4px;
-        font-size: 16px;
-    }
-    .delete-button:hover {
-        background-color: #FFE4E1;
-    }
-    .streaming-indicator {
-        display: inline-block;
-        animation: pulse 1.5s infinite;
-    }
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
-    }
-    </style>
-    """, unsafe_allow_html=True)
+THINKING_PATTERN = re.compile(r"<thinking>([\s\S]*?)</thinking>", re.IGNORECASE)
+CODE_BLOCK_PATTERN = re.compile(r"```(\w+)?\n([\s\S]*?)```")
 
+
+def _ensure_state(provider_names: list[str]) -> None:
+    if "playground_state" not in st.session_state:
+        st.session_state.playground_state = {
+            "sessions": {},
+            "current_session_id": None,
+            "input_history": [],
+            "models_cache": {},
+            "loaded_from_db": False,
+        }
+
+    state = st.session_state.playground_state
+    if not state.get("loaded_from_db"):
+        loaded_sessions, current_id = _load_sessions_from_db(provider_names)
+        state["sessions"] = loaded_sessions
+        state["current_session_id"] = current_id
+        state["loaded_from_db"] = True
+
+    if not state["sessions"]:
+        _create_new_session(provider_names)
+
+
+def _create_new_session(provider_names: list[str], persist: bool = True) -> str:
+    state = st.session_state.playground_state
+    session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    default_provider = provider_names[0] if provider_names else None
+    state["sessions"][session_id] = {
+        "id": session_id,
+        "title": "新对话",
+        "created_at": datetime.datetime.now().isoformat(),
+        "messages": [],
+        "provider": default_provider,
+        "model": None,
+        "is_streaming": False,
+        "streaming_index": None,
+        "last_error": None,
+    }
+    state["current_session_id"] = session_id
+    if persist:
+        _upsert_session_to_db(state["sessions"][session_id])
+    return session_id
+
+
+def _upsert_session_to_db(session_data: dict[str, Any]) -> None:
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        db_obj = (
+            session.query(PlaygroundChatSession)
+            .filter(PlaygroundChatSession.session_uid == session_data["id"])
+            .first()
+        )
+        if db_obj is None:
+            db_obj = PlaygroundChatSession(
+                session_uid=session_data["id"],
+                title=session_data.get("title") or "新对话",
+                provider_name=session_data.get("provider"),
+                model_name=session_data.get("model"),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(db_obj)
+        else:
+            db_obj.title = session_data.get("title") or "新对话"
+            db_obj.provider_name = session_data.get("provider")
+            db_obj.model_name = session_data.get("model")
+            db_obj.updated_at = now
+        session.commit()
+
+
+def _upsert_message_to_db(session_uid: str, seq: int, role: str, content: str) -> None:
+    with SessionLocal() as session:
+        db_obj = (
+            session.query(PlaygroundChatMessage)
+            .filter(
+                PlaygroundChatMessage.session_uid == session_uid,
+                PlaygroundChatMessage.seq == seq,
+            )
+            .first()
+        )
+        if db_obj is None:
+            db_obj = PlaygroundChatMessage(
+                session_uid=session_uid,
+                seq=seq,
+                role=role,
+                content=content or "",
+            )
+            session.add(db_obj)
+        else:
+            db_obj.role = role
+            db_obj.content = content or ""
+        session.commit()
+
+
+def _delete_session_from_db(session_uid: str) -> None:
+    with SessionLocal() as session:
+        session.query(PlaygroundChatMessage).filter(PlaygroundChatMessage.session_uid == session_uid).delete()
+        session.query(PlaygroundChatSession).filter(PlaygroundChatSession.session_uid == session_uid).delete()
+        session.commit()
+
+
+def _load_sessions_from_db(provider_names: list[str]) -> tuple[dict[str, dict[str, Any]], str | None]:
+    sessions: dict[str, dict[str, Any]] = {}
+    current_id: str | None = None
+    with SessionLocal() as session:
+        db_sessions = (
+            session.query(PlaygroundChatSession)
+            .order_by(PlaygroundChatSession.updated_at.asc(), PlaygroundChatSession.id.asc())
+            .all()
+        )
+        for db_item in db_sessions:
+            sid = db_item.session_uid
+            provider = (
+                db_item.provider_name
+                if db_item.provider_name in provider_names
+                else (provider_names[0] if provider_names else None)
+            )
+            sess = {
+                "id": sid,
+                "title": db_item.title or "新对话",
+                "created_at": (db_item.created_at or datetime.datetime.utcnow()).isoformat(),
+                "messages": [],
+                "provider": provider,
+                "model": db_item.model_name,
+                "is_streaming": False,
+                "streaming_index": None,
+                "last_error": None,
+            }
+            db_messages = (
+                session.query(PlaygroundChatMessage)
+                .filter(PlaygroundChatMessage.session_uid == sid)
+                .order_by(PlaygroundChatMessage.seq.asc(), PlaygroundChatMessage.id.asc())
+                .all()
+            )
+            for msg in db_messages:
+                sess["messages"].append({"role": msg.role, "content": msg.content or ""})
+            sessions[sid] = sess
+            current_id = sid
+    return sessions, current_id
+
+
+def _get_provider_to_key() -> dict[str, tuple[Provider, APIKey]]:
     with SessionLocal() as session:
         providers = session.query(Provider).all()
         active_keys = session.query(APIKey).filter(APIKey.is_active.is_(True)).all()
 
-    if "chat_sessions" not in st.session_state:
-        st.session_state.chat_sessions = {}
-    if "current_session_id" not in st.session_state:
-        st.session_state.current_session_id = None
-    if "input_history" not in st.session_state:
-        st.session_state.input_history = []
-    if "input_history_index" not in st.session_state:
-        st.session_state.input_history_index = -1
-    if "streaming_sessions" not in st.session_state:
-        st.session_state.streaming_sessions = {}
-    if "sidebar_collapsed" not in st.session_state:
-        st.session_state.sidebar_collapsed = False
+    provider_to_key: dict[str, tuple[Provider, APIKey]] = {}
+    for provider in providers:
+        key = next((k for k in active_keys if k.provider_id == provider.id), None)
+        if key:
+            provider_to_key[provider.name] = (provider, key)
+    return provider_to_key
 
-    if not providers:
-        st.warning("暂无供应商，请先到「供应商管理」添加。")
-    elif not active_keys:
-        st.warning("暂无可用 API Key，请先到「API Key 管理」添加并启用。")
-    else:
-        provider_to_key = {}
-        for p in providers:
-            key = next((k for k in active_keys if k.provider_id == p.id), None)
-            if key:
-                provider_to_key[p.name] = (p, key)
 
-        if not provider_to_key:
-            st.warning("暂无配置了有效 API Key 的供应商。")
-        else:
-            provider_names = list(provider_to_key.keys())
+def _get_text_models(provider: Provider, key: APIKey) -> list[str]:
+    state = st.session_state.playground_state
+    cache_key = f"provider_models_{provider.id}"
+    if cache_key not in state["models_cache"]:
+        state["models_cache"][cache_key] = fetch_models(provider.api_base, key.key)
+    models = state["models_cache"][cache_key]
+    return [m for m in models if classify_model_type(m) == "text"]
 
-            with st.sidebar:
-                st.markdown("## 📁 对话历史")
-                
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    if st.button("➕ 新建对话", use_container_width=True):
-                        new_session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                        st.session_state.chat_sessions[new_session_id] = {
-                            "messages": [],
-                            "provider": provider_names[0] if provider_names else None,
-                            "model": None,
-                            "title": "新对话",
-                            "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            "is_streaming": False,
-                            "streaming_content": ""
-                        }
-                        st.session_state.current_session_id = new_session_id
-                        st.rerun()
 
-                st.markdown("---")
-                
-                if st.session_state.chat_sessions:
-                    for session_id in reversed(st.session_state.chat_sessions.keys()):
-                        session_data = st.session_state.chat_sessions[session_id]
-                        is_active = st.session_state.current_session_id == session_id
-                        is_streaming = session_data.get("is_streaming", False)
-                        
-                        col1, col2 = st.columns([4, 1])
-                        with col1:
-                            button_label = f"💬 {session_data['title']}"
-                            if is_streaming:
-                                button_label += " 🔄"
-                            if st.button(
-                                button_label,
-                                key=f"load_{session_id}",
-                                use_container_width=True,
-                                type="primary" if is_active else "secondary"
-                            ):
-                                st.session_state.current_session_id = session_id
-                                st.rerun()
-                        with col2:
-                            if st.button("🗑️", key=f"delete_{session_id}"):
-                                if session_id in st.session_state.streaming_sessions:
-                                    del st.session_state.streaming_sessions[session_id]
-                                del st.session_state.chat_sessions[session_id]
-                                if st.session_state.current_session_id == session_id:
-                                    if st.session_state.chat_sessions:
-                                        st.session_state.current_session_id = next(iter(st.session_state.chat_sessions.keys()))
-                                    else:
-                                        st.session_state.current_session_id = None
-                                st.rerun()
-                else:
-                    st.info("暂无对话历史，开始一个新对话吧！")
+def _format_title(messages: list[dict[str, Any]]) -> str:
+    for msg in messages:
+        if msg.get("role") == "user" and msg.get("content"):
+            text = msg["content"].strip()
+            if text:
+                return text[:30] + ("..." if len(text) > 30 else "")
+    return "新对话"
 
-            if not st.session_state.current_session_id or st.session_state.current_session_id not in st.session_state.chat_sessions:
-                if st.session_state.chat_sessions:
-                    st.session_state.current_session_id = next(iter(st.session_state.chat_sessions.keys()))
-                else:
-                    new_session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    st.session_state.chat_sessions[new_session_id] = {
-                        "messages": [],
-                        "provider": provider_names[0] if provider_names else None,
-                        "model": None,
-                        "title": "新对话",
-                        "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        "is_streaming": False,
-                        "streaming_content": ""
-                    }
-                    st.session_state.current_session_id = new_session_id
 
-            current_session = st.session_state.chat_sessions[st.session_state.current_session_id]
-            
-            st.markdown(f"""
-            <div style="margin-bottom: 10px;">
-                <h3 style="margin: 0; padding: 0;">{current_session['title']}</h3>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            def render_message(msg):
-                if msg["role"] == "user":
-                    st.markdown(f"""
-                    <div class="user-message-container">
-                        <div class="user-message">{msg['content']}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                elif msg["role"] == "assistant":
-                    content = msg['content']
-                    thinking_content = None
-                    thinking_pattern = r'<thinking>([\s\S]*?)</thinking>'
-                    thinking_match = re.search(thinking_pattern, content)
-                    if thinking_match:
-                        thinking_content = thinking_match.group(1).strip()
-                        content = content[thinking_match.end():].strip()
-                    
-                    final_html = ""
-                    if thinking_content:
-                        thinking_id = f"thinking_{id(thinking_content)}"
-                        final_html += f"""
-                        <div class="thinking-block">
-                            <div class="thinking-header" onclick="
-                                var content = document.getElementById('{thinking_id}');
-                                if (content.classList.contains('collapsed')) {{
-                                    content.classList.remove('collapsed');
-                                }} else {{
-                                    content.classList.add('collapsed');
-                                }}
-                            ">
-                                <span>🤔 思考过程</span>
-                                <span>▼</span>
-                            </div>
-                            <div id="{thinking_id}" class="thinking-content collapsed">
-                                <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{thinking_content}</pre>
-                            </div>
-                        </div>
-                        """
-                    
-                    parts = re.split(r'(```[\s\S]*?```)', content)
-                    for part in parts:
-                        if part.startswith('```') and part.endswith('```'):
-                            code_content = part[3:-3].strip()
-                            first_line_end = code_content.find('\n')
-                            if first_line_end > 0:
-                                language = code_content[:first_line_end].strip()
-                                actual_code = code_content[first_line_end+1:]
-                            else:
-                                language = "code"
-                                actual_code = code_content
-                            
-                            code_id = f"code_{id(actual_code)}"
-                            final_html += f"""
-                            <div class="code-block-container">
-                                <div class="code-block-header">
-                                    <span>{language}</span>
-                                    <button class="copy-button" onclick="
-                                        var codeElement = document.getElementById('{code_id}');
-                                        var range = document.createRange();
-                                        range.selectNode(codeElement);
-                                        window.getSelection().removeAllRanges();
-                                        window.getSelection().addRange(range);
-                                        document.execCommand('copy');
-                                        window.getSelection().removeAllRanges();
-                                        this.textContent = '已复制!';
-                                        setTimeout(() => {{ this.textContent = '复制'; }}, 2000);
-                                    ">复制</button>
-                                </div>
-                                <div class="code-block-content">
-                                    <pre id="{code_id}" style="margin: 0; white-space: pre-wrap;">{actual_code}</pre>
-                                </div>
-                            </div>
-                            """
-                        else:
-                            if part.strip():
-                                final_html += f"<p style='margin: 8px 0; white-space: pre-wrap;'>{part}</p>"
-                    
-                    st.markdown(f"""
-                    <div class="assistant-message-container">
-                        <div class="assistant-message">{final_html}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                elif msg["role"] == "error":
-                    st.markdown(f"""
-                    <div class="error-message-container">
-                        <div class="error-message">❌ {msg['content']}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+def _build_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    payload_messages: list[dict[str, str]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = str(msg.get("content") or "")
+        payload_messages.append({"role": role, "content": content})
+    return payload_messages
 
-            chat_container = st.container()
-            with chat_container:
-                if not current_session["messages"]:
-                    st.markdown("""
-                    <div style="text-align: center; margin-top: 100px; color: #888;">
-                        <h2>👋 你好！</h2>
-                        <p>选择一个模型，开始与 AI 对话吧。</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    for msg in current_session["messages"]:
-                        render_message(msg)
-                    
-                    if current_session.get("is_streaming", False) and current_session.get("streaming_content", ""):
-                        streaming_content = current_session["streaming_content"]
-                        thinking_content = None
-                        thinking_pattern = r'<thinking>([\s\S]*?)</thinking>'
-                        thinking_match = re.search(thinking_pattern, streaming_content)
-                        if thinking_match:
-                            thinking_content = thinking_match.group(1).strip()
-                            remaining_content = streaming_content[thinking_match.end():].strip()
-                        else:
-                            remaining_content = streaming_content
-                        
-                        final_html = ""
-                        if thinking_content:
-                            thinking_id = f"streaming_thinking_{id(streaming_content)}"
-                            final_html += f"""
-                            <div class="thinking-block">
-                                <div class="thinking-header" onclick="
-                                    var content = document.getElementById('{thinking_id}');
-                                    if (content.classList.contains('collapsed')) {{
-                                        content.classList.remove('collapsed');
-                                    }} else {{
-                                        content.classList.add('collapsed');
-                                    }}
-                                ">
-                                    <span>🤔 思考过程</span>
-                                    <span>▼</span>
-                                </div>
-                                <div id="{thinking_id}" class="thinking-content">
-                                    <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{thinking_content}</pre>
-                                </div>
-                            </div>
-                            """
-                        
-                        if remaining_content:
-                            final_html += f"<p style='margin: 8px 0; white-space: pre-wrap;'>{remaining_content}<span class='streaming-indicator'>▌</span></p>"
-                        
-                        st.markdown(f"""
-                        <div class="assistant-message-container">
-                            <div class="assistant-message">{final_html}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
 
-            st.markdown("---")
-            
-            with st.container():
-                st.markdown('<div class="input-area">', unsafe_allow_html=True)
-                
-                provider_col, model_col = st.columns([1, 1])
-                with provider_col:
-                    selected_provider_name = st.selectbox(
-                        "选择供应商",
-                        options=provider_names,
-                        key="selected_provider",
-                        index=provider_names.index(current_session["provider"]) if current_session["provider"] in provider_names else 0
-                    )
-                    if selected_provider_name != current_session["provider"]:
-                        current_session["provider"] = selected_provider_name
-                        current_session["model"] = None
+def _start_stream_worker(
+    state: dict[str, Any],
+    session_id: str,
+    provider: Provider,
+    key: APIKey,
+    model_name: str,
+    payload_messages: list[dict[str, str]],
+) -> None:
+    def run_stream() -> None:
+        usage_data: dict[str, Any] = {}
+        try:
+            url = f"{provider.api_base.rstrip('/')}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {key.key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": payload_messages,
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "stream": True,
+            }
 
-                selected_provider, selected_key = provider_to_key[selected_provider_name]
-                
-                cache_key = f"provider_models_{selected_provider.id}"
-                if cache_key not in st.session_state:
-                    st.session_state[cache_key] = fetch_models(selected_provider.api_base, selected_key.key)
-                
-                provider_models = st.session_state[cache_key]
-                text_models = [m for m in provider_models if classify_model_type(m) == "text"]
-                
-                with model_col:
-                    if text_models:
-                        selected_model = st.selectbox(
-                            "选择模型",
-                            options=text_models,
-                            key="selected_model",
-                            index=text_models.index(current_session["model"]) if current_session["model"] in text_models else 0
-                        )
-                        current_session["model"] = selected_model
-                    else:
-                        st.warning("未获取到文本模型列表。")
-                        selected_model = None
-
-                def send_message(user_input):
-                    if not selected_model:
-                        st.error("请先选择一个模型。")
+            resp = requests.post(url, headers=headers, json=payload, timeout=180, stream=True)
+            if resp.status_code != 200:
+                err = f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}"
+                with _WORKER_LOCK:
+                    session = state["sessions"].get(session_id)
+                    if session is None:
                         return
-                    
-                    if user_input:
-                        if user_input not in st.session_state.input_history:
-                            st.session_state.input_history.append(user_input)
-                        st.session_state.input_history_index = -1
-                    
-                    if not current_session["messages"]:
-                        current_session["title"] = user_input[:30] + ("..." if len(user_input) > 30 else "")
-                    
-                    current_session["messages"].append({"role": "user", "content": user_input})
-                    
+                    stream_idx = session.get("streaming_index")
+                    if stream_idx is not None and 0 <= stream_idx < len(session["messages"]):
+                        session["messages"][stream_idx] = {"role": "error", "content": err}
+                    else:
+                        session["messages"].append({"role": "error", "content": err})
+                    session["is_streaming"] = False
+                    session["streaming_index"] = None
+                    session["last_error"] = err
+                    msg_idx = len(session["messages"]) - 1
+                    if msg_idx >= 0:
+                        msg = session["messages"][msg_idx]
+                        _upsert_message_to_db(
+                            session_uid=session_id,
+                            seq=msg_idx,
+                            role=msg.get("role") or "error",
+                            content=msg.get("content") or "",
+                        )
+                    _upsert_session_to_db(session)
+                return
+
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                chunk_data = line[6:]
+                if chunk_data.strip() == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(chunk_data)
+                except json.JSONDecodeError:
+                    continue
+
+                delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
+                piece = delta.get("content") or ""
+                if chunk.get("usage"):
+                    usage_data = chunk["usage"]
+
+                if piece:
+                    with _WORKER_LOCK:
+                        session = state["sessions"].get(session_id)
+                        if session is None:
+                            return
+                        stream_idx = session.get("streaming_index")
+                        if stream_idx is None or stream_idx >= len(session["messages"]):
+                            return
+                        session["messages"][stream_idx]["content"] += piece
+
+            with _WORKER_LOCK:
+                session = state["sessions"].get(session_id)
+                if session is None:
+                    return
+                stream_idx = session.get("streaming_index")
+                if stream_idx is not None and 0 <= stream_idx < len(session["messages"]):
+                    if not session["messages"][stream_idx].get("content"):
+                        session["messages"][stream_idx]["content"] = "(空响应)"
+                session["is_streaming"] = False
+                session["streaming_index"] = None
+
+            prompt_tokens = usage_data.get("prompt_tokens") or 0
+            completion_tokens = usage_data.get("completion_tokens") or 0
+            total_tokens = usage_data.get("total_tokens") or (prompt_tokens + completion_tokens)
+            log_custom_usage(
+                key_id=key.id,
+                model_name=model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
+            with _WORKER_LOCK:
+                session = state["sessions"].get(session_id)
+                if session is not None:
+                    msg_idx = len(session["messages"]) - 1
+                    if msg_idx >= 0:
+                        msg = session["messages"][msg_idx]
+                        _upsert_message_to_db(
+                            session_uid=session_id,
+                            seq=msg_idx,
+                            role=msg.get("role") or "assistant",
+                            content=msg.get("content") or "",
+                        )
+                    _upsert_session_to_db(session)
+
+        except Exception as exc:
+            err = f"请求异常：{exc}"
+            with _WORKER_LOCK:
+                session = state["sessions"].get(session_id)
+                if session is None:
+                    return
+                stream_idx = session.get("streaming_index")
+                if stream_idx is not None and 0 <= stream_idx < len(session["messages"]):
+                    if session["messages"][stream_idx].get("content"):
+                        session["messages"].append({"role": "error", "content": err})
+                    else:
+                        session["messages"][stream_idx] = {"role": "error", "content": err}
+                else:
+                    session["messages"].append({"role": "error", "content": err})
+                session["is_streaming"] = False
+                session["streaming_index"] = None
+                session["last_error"] = err
+                msg_idx = len(session["messages"]) - 1
+                if msg_idx >= 0:
+                    msg = session["messages"][msg_idx]
+                    _upsert_message_to_db(
+                        session_uid=session_id,
+                        seq=msg_idx,
+                        role=msg.get("role") or "error",
+                        content=msg.get("content") or "",
+                    )
+                _upsert_session_to_db(session)
+        finally:
+            with _WORKER_LOCK:
+                _WORKER_THREADS.pop(session_id, None)
+
+    with _WORKER_LOCK:
+        existing = _WORKER_THREADS.get(session_id)
+        if existing and existing.is_alive():
+            return
+        worker = threading.Thread(target=run_stream, daemon=True, name=f"playground_stream_{session_id}")
+        _WORKER_THREADS[session_id] = worker
+        worker.start()
+
+
+def _render_user_message(content: str) -> None:
+    safe_text = html.escape(content or "")
+    st.markdown(
+        f"""
+        <div class="chat-row chat-row-user">
+            <div class="chat-bubble chat-bubble-user">{safe_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
+    text = content or ""
+    thinking_parts = THINKING_PATTERN.findall(text)
+    content_without_thinking = THINKING_PATTERN.sub("", text).strip()
+
+    for idx, think in enumerate(thinking_parts):
+        with st.expander(f"思考过程 #{idx + 1}", expanded=False):
+            st.markdown(think)
+
+    if not content_without_thinking and is_streaming:
+        st.markdown("▌")
+        return
+
+    cursor = 0
+    for match in CODE_BLOCK_PATTERN.finditer(content_without_thinking):
+        start, end = match.span()
+        if start > cursor:
+            plain_text = content_without_thinking[cursor:start]
+            if plain_text.strip():
+                st.markdown(plain_text)
+
+        lang = (match.group(1) or "text").strip()
+        code = match.group(2) or ""
+        st.code(code, language=lang)
+        cursor = end
+
+    if cursor < len(content_without_thinking):
+        tail = content_without_thinking[cursor:]
+        if tail.strip() or is_streaming:
+            st.markdown(tail + ("\n\n▌" if is_streaming else ""))
+
+
+def _render_error_message(content: str) -> None:
+    st.error(content or "未知错误")
+
+
+def _render_messages(messages: list[dict[str, Any]], current_session_streaming: bool) -> None:
+    if not messages:
+        st.markdown(
+            """
+            <div class="chat-empty-state">
+                <h3>开始一个新对话</h3>
+                <p>在下方输入框发送消息，支持流式回复、代码块和思考折叠。</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if role == "user":
+            _render_user_message(content)
+        elif role == "assistant":
+            is_streaming = current_session_streaming and idx == len(messages) - 1
+            if is_streaming and not str(content).strip():
+                st.markdown(
+                    '<div class="chat-row chat-row-assistant"><div class="chat-stream-cursor">▌</div></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                _render_assistant_message(content, is_streaming=is_streaming)
+        elif role == "system":
+            st.info(content)
+        elif role == "error":
+            _render_error_message(content)
+
+
+def _apply_page_style() -> None:
+    st.markdown(
+        """
+        <style>
+        html, body {
+            overflow: hidden !important;
+        }
+        [data-testid="stAppViewContainer"] {
+            overflow: hidden !important;
+        }
+        [data-testid="stMain"] {
+            overflow: hidden !important;
+        }
+        .block-container {
+            padding-top: 0.55rem;
+            padding-bottom: 9.5rem;
+            max-width: 1380px;
+            height: calc(100vh - 1rem);
+            overflow: hidden;
+        }
+        .block-container h3 {
+            margin-top: 0.1rem;
+            margin-bottom: 0.25rem;
+        }
+        [data-testid="stCaptionContainer"] {
+            margin-top: 0;
+            margin-bottom: 0.35rem;
+        }
+        .chat-row {
+            display: flex;
+            width: 100%;
+            margin-bottom: 0.85rem;
+        }
+        .chat-row-user {
+            justify-content: flex-end;
+        }
+        .chat-row-assistant {
+            justify-content: flex-start;
+        }
+        .chat-bubble {
+            border-radius: 16px;
+            padding: 0.75rem 0.95rem;
+            word-break: break-word;
+            line-height: 1.5;
+        }
+        .chat-bubble-user {
+            max-width: 75%;
+            background: #1f6feb;
+            color: #fff;
+            border-bottom-right-radius: 4px;
+        }
+        .chat-bubble-assistant {
+            width: 100%;
+            background: #f6f8fb;
+            border: 1px solid #e6ebf2;
+            border-bottom-left-radius: 4px;
+        }
+        .chat-empty-state {
+            text-align: center;
+            margin-top: 3.5rem;
+            color: #6b7280;
+        }
+        .chat-stream-cursor {
+            color: #f8fafc;
+            font-size: 1.2rem;
+            line-height: 1;
+            padding: 0.1rem 0.3rem;
+        }
+        .chat-meta {
+            font-size: 0.85rem;
+            color: #6b7280;
+            margin-bottom: 0.35rem;
+        }
+        .st-key-pg_dock {
+            position: sticky;
+            bottom: 4.0rem;
+            z-index: 20;
+            padding: 0.55rem 0 0.2rem 0;
+            transform: translateY(-14px);
+            backdrop-filter: blur(6px);
+            background: rgba(10, 14, 30, 0.72);
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .st-key-pg_dock [data-baseweb="select"] {
+            margin-bottom: 0;
+        }
+        .status-pill {
+            width: 100%;
+            height: 2.5rem;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            padding: 0 0.9rem;
+            font-weight: 600;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-sizing: border-box;
+            margin-top: 0.15rem;
+        }
+        .status-pill.idle {
+            color: #86efac;
+            background: rgba(21, 128, 61, 0.28);
+        }
+        .status-pill.streaming {
+            color: #93c5fd;
+            background: rgba(29, 78, 216, 0.28);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_session_panel(
+    state: dict[str, Any],
+    provider_names: list[str],
+    provider_to_key: dict[str, tuple[Provider, APIKey]],
+) -> None:
+    current_session_id = state["current_session_id"]
+    current_session = state["sessions"][current_session_id]
+
+    if current_session.get("provider") not in provider_names:
+        current_session["provider"] = provider_names[0]
+
+    selected_provider_name = current_session["provider"]
+    selected_provider, selected_key = provider_to_key[selected_provider_name]
+    text_models = _get_text_models(selected_provider, selected_key)
+
+    if current_session.get("model") not in text_models:
+        current_session["model"] = text_models[0] if text_models else None
+
+    st.markdown("### 模型体验")
+    st.caption("底部输入，支持流式回复。切换历史对话时，后台生成会持续进行。")
+
+    with _WORKER_LOCK:
+        message_snapshot = [dict(item) for item in current_session["messages"]]
+        current_streaming = bool(current_session.get("is_streaming", False))
+
+
+    chat_scroll = st.container(height=610, key="pg_chat_scroll", autoscroll=True)
+    with chat_scroll:
+        _render_messages(message_snapshot, current_streaming)
+
+    with st.container(key="pg_dock"):
+        config_col1, config_col2, config_col3 = st.columns([1.2, 1.6, 1.2])
+        with config_col1:
+            provider_choice = st.selectbox(
+                "供应商",
+                options=provider_names,
+                index=provider_names.index(current_session["provider"]),
+                key=f"provider_picker_{current_session_id}",
+                label_visibility="collapsed",
+                placeholder="选择供应商",
+            )
+            if provider_choice != current_session["provider"]:
+                current_session["provider"] = provider_choice
+                current_session["model"] = None
+                _upsert_session_to_db(current_session)
+                st.rerun()
+
+        selected_provider, selected_key = provider_to_key[current_session["provider"]]
+        text_models = _get_text_models(selected_provider, selected_key)
+
+        with config_col2:
+            if not text_models:
+                st.warning("当前供应商未获取到文本模型。")
+                selected_model = None
+            else:
+                selected_model = st.selectbox(
+                    "模型",
+                    options=text_models,
+                    index=text_models.index(current_session["model"]) if current_session["model"] in text_models else 0,
+                    key=f"model_picker_{current_session_id}",
+                    label_visibility="collapsed",
+                    placeholder="选择模型",
+                )
+                if current_session["model"] != selected_model:
+                    current_session["model"] = selected_model
+                    _upsert_session_to_db(current_session)
+
+        with config_col3:
+            if current_streaming:
+                st.markdown('<div class="status-pill streaming">生成中</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="status-pill idle">空闲</div>', unsafe_allow_html=True)
+
+        with st.form(key=f"chat_form_{current_session_id}", clear_on_submit=True, border=False):
+            input_col, send_col = st.columns([12, 1.6])
+            with input_col:
+                prompt = st.text_input(
+                    "输入消息",
+                    key=f"chat_input_{current_session_id}",
+                    label_visibility="collapsed",
+                    placeholder="输入消息（Enter 发送）",
+                    disabled=current_streaming or not bool(current_session.get("model")),
+                )
+            with send_col:
+                submitted = st.form_submit_button(
+                    "发送",
+                    use_container_width=True,
+                    disabled=current_streaming or not bool(current_session.get("model")),
+                )
+
+        if submitted and prompt:
+            if not current_session.get("model"):
+                st.warning("请先选择模型。")
+            else:
+                text = prompt.strip()
+                if text:
+                    state["input_history"].append(text)
+                    current_session["messages"].append({"role": "user", "content": text})
+                    current_session["messages"].append({"role": "assistant", "content": ""})
                     current_session["is_streaming"] = True
-                    current_session["streaming_content"] = ""
-                    
-                    def stream_response():
-                        try:
-                            url = f"{selected_provider.api_base.rstrip('/')}/chat/completions"
-                            headers = {
-                                "Authorization": f"Bearer {selected_key.key}",
-                                "Content-Type": "application/json",
-                            }
-                            
-                            _send_messages = []
-                            _send_messages.extend(current_session["messages"][:-1])
-                            _send_messages.append({"role": "user", "content": user_input})
-                            
-                            payload = {
-                                "model": selected_model,
-                                "messages": _send_messages,
-                                "max_tokens": 4096,
-                                "temperature": 0.7,
-                                "stream": True,
-                            }
-                            
-                            resp = requests.post(url, headers=headers, json=payload, timeout=120, stream=True)
-                            if resp.status_code == 200:
-                                collected_text = []
-                                usage_data = {}
-                                
-                                for line in resp.iter_lines(decode_unicode=True):
-                                    if not current_session.get("is_streaming", False):
-                                        break
-                                    
-                                    if not line or not line.startswith("data: "):
-                                        continue
-                                    data_str = line[6:]
-                                    if data_str.strip() == "[DONE]":
-                                        break
-                                    try:
-                                        chunk = json.loads(data_str)
-                                        delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
-                                        content_piece = delta.get("content") or ""
-                                        if content_piece:
-                                            collected_text.append(content_piece)
-                                            current_session["streaming_content"] = "".join(collected_text)
-                                        if chunk.get("usage"):
-                                            usage_data = chunk["usage"]
-                                    except (json.JSONDecodeError, Exception):
-                                        continue
-                                
-                                final_text = "".join(collected_text) or "(空响应)"
-                                current_session["messages"].append({"role": "assistant", "content": final_text})
-                                
-                                ptk = (usage_data.get("prompt_tokens") or 0)
-                                ctk = (usage_data.get("completion_tokens") or 0)
-                                ttk = (usage_data.get("total_tokens") or (ptk + ctk))
-                                log_custom_usage(
-                                    key_id=selected_key.id,
-                                    model_name=selected_model,
-                                    prompt_tokens=ptk,
-                                    completion_tokens=ctk,
-                                    total_tokens=ttk,
-                                )
-                            else:
-                                error_msg = f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}"
-                                current_session["messages"].append({"role": "error", "content": error_msg})
-                        except Exception as e:
-                            error_msg = f"请求异常：{str(e)}"
-                            current_session["messages"].append({"role": "error", "content": error_msg})
-                        finally:
-                            current_session["is_streaming"] = False
-                            current_session["streaming_content"] = ""
-                    
-                    session_id = st.session_state.current_session_id
-                    st.session_state.streaming_sessions[session_id] = executor.submit(stream_response)
-                    
+                    current_session["streaming_index"] = len(current_session["messages"]) - 1
+                    current_session["title"] = _format_title(current_session["messages"])
+                    user_idx = len(current_session["messages"]) - 2
+                    assistant_idx = len(current_session["messages"]) - 1
+                    _upsert_session_to_db(current_session)
+                    _upsert_message_to_db(
+                        session_uid=current_session_id,
+                        seq=user_idx,
+                        role="user",
+                        content=text,
+                    )
+                    _upsert_message_to_db(
+                        session_uid=current_session_id,
+                        seq=assistant_idx,
+                        role="assistant",
+                        content="",
+                    )
+
+                    payload_messages = _build_api_messages(current_session["messages"][:-1])
+                    _start_stream_worker(
+                        state=state,
+                        session_id=current_session_id,
+                        provider=selected_provider,
+                        key=selected_key,
+                        model_name=current_session["model"],
+                        payload_messages=payload_messages,
+                    )
                     st.rerun()
 
-                user_input = st.chat_input("输入消息并回车发送...", key="main_chat_input")
-                
-                if user_input:
-                    if current_session.get("is_streaming", False):
-                        st.warning("请等待当前回复完成后再发送新消息。")
-                    else:
-                        send_message(user_input)
-                
-                st.markdown('</div>', unsafe_allow_html=True)
 
-            if current_session.get("is_streaming", False):
-                st.empty()
+def render_playground_page() -> None:
+    _apply_page_style()
+
+    provider_to_key = _get_provider_to_key()
+    if not provider_to_key:
+        st.warning("暂无配置了有效 API Key 的供应商，请先在供应商/API Key 页面完成配置。")
+        return
+
+    provider_names = list(provider_to_key.keys())
+    _ensure_state(provider_names)
+    state = st.session_state.playground_state
+
+    if (
+        state["current_session_id"] not in state["sessions"]
+        and state["sessions"]
+    ):
+        state["current_session_id"] = next(iter(state["sessions"].keys()))
+
+    with st.sidebar:
+        st.markdown("### 对话历史")
+        if st.button("➕ 新建对话", use_container_width=True):
+            _create_new_session(provider_names)
+            st.rerun()
+
+        st.markdown("---")
+        for session_id in list(reversed(list(state["sessions"].keys()))):
+            session = state["sessions"][session_id]
+            title = session.get("title") or "新对话"
+            status = " ⏳" if session.get("is_streaming") else ""
+            is_active = session_id == state["current_session_id"]
+
+            col_a, col_b = st.columns([5, 1])
+            with col_a:
+                if st.button(
+                    f"💬 {title}{status}",
+                    key=f"switch_{session_id}",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                ):
+                    state["current_session_id"] = session_id
+                    st.rerun()
+            with col_b:
+                if st.button("🗑", key=f"drop_{session_id}"):
+                    if session.get("is_streaming"):
+                        st.warning("该对话正在生成中，暂不支持删除。")
+                    else:
+                        _delete_session_from_db(session_id)
+                        del state["sessions"][session_id]
+                        if not state["sessions"]:
+                            _create_new_session(provider_names)
+                        elif state["current_session_id"] == session_id:
+                            state["current_session_id"] = next(iter(state["sessions"].keys()))
+                        st.rerun()
+
+    has_streaming_session = any(s.get("is_streaming") for s in state["sessions"].values())
+
+    if hasattr(st, "fragment"):
+        run_every = "800ms" if has_streaming_session else None
+
+        @st.fragment(run_every=run_every)
+        def _live_panel() -> None:
+            _render_session_panel(
+                state=state,
+                provider_names=provider_names,
+                provider_to_key=provider_to_key,
+            )
+
+        _live_panel()
+    else:
+        _render_session_panel(
+            state=state,
+            provider_names=provider_names,
+            provider_to_key=provider_to_key,
+        )
