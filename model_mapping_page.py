@@ -120,7 +120,7 @@ def render_model_mapping_page():
         if mappings:
             st.caption("💡 使用 ⬆️⬇️ 按钮调整模型顺序，顺序将影响工具中的默认选择。点击编辑或删除按钮进行相应操作。")
 
-            h1, h2, h3, h4, h5, h6, h7 = st.columns([0.5, 1, 3, 5, 2, 1, 1])
+            h1, h2, h3, h4, h5, h6, h7 = st.columns([0.5, 1.2, 3, 5, 2, 1, 1])
             h1.write("**#**")
             h2.write("**排序**")
             h3.write("**虚拟名称**")
@@ -131,15 +131,16 @@ def render_model_mapping_page():
             st.divider()
 
             for idx, (m, p) in enumerate(mappings):
-                c1, c2, c3, c4, c5, c6, c7 = st.columns([0.5, 1, 3, 5, 2, 1, 1])
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([0.5, 1.2, 3, 5, 2, 1, 1])
                 c1.write(f"{idx + 1}")
-                btn_up, btn_down = c2.columns(2)
-                if btn_up.button("⬆️", key=f"up_m_{m.id}", disabled=(idx == 0)):
-                    move_model_mapping(m.id, "up")
-                    st.rerun()
-                if btn_down.button("⬇️", key=f"down_m_{m.id}", disabled=(idx == len(mappings) - 1)):
-                    move_model_mapping(m.id, "down")
-                    st.rerun()
+                with c2:
+                    btn_up, btn_down = st.columns(2)
+                    if btn_up.button("⬆️", key=f"up_m_{m.id}", disabled=(idx == 0), use_container_width=True):
+                        move_model_mapping(m.id, "up")
+                        st.rerun()
+                    if btn_down.button("⬇️", key=f"down_m_{m.id}", disabled=(idx == len(mappings) - 1), use_container_width=True):
+                        move_model_mapping(m.id, "down")
+                        st.rerun()
                 c3.write(f"**{m.virtual_name}**")
                 c4.write(f"`{m.real_name}`")
                 c5.write(p.name)
