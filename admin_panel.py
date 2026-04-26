@@ -36,7 +36,7 @@ st.set_page_config(page_title="AI Proxy Master Admin", layout="wide", initial_si
 # --- 密码认证 ---
 _admin_password = os.getenv("ADMIN_PASSWORD", "")
 _admin_host = (os.getenv("ADMIN_HOST", "0.0.0.0") or "").strip().lower()
-_is_local_admin_host = _admin_host in {"127.0.0.1", "localhost", "::1"}
+_is_local_admin_host = _admin_host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 if not _admin_password and not _is_local_admin_host:
     st.error("安全限制：ADMIN_HOST 非本地地址时，必须设置 ADMIN_PASSWORD。")
