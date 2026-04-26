@@ -216,230 +216,227 @@ def render_playground_page():
                 else:
                     st.info("暂无对话历史，开始一个新对话吧！")
 
-            main_col, _ = st.columns([5, 0])
+            if not st.session_state.current_session_id or st.session_state.current_session_id not in st.session_state.chat_sessions:
+                if st.session_state.chat_sessions:
+                    st.session_state.current_session_id = next(iter(st.session_state.chat_sessions.keys()))
+                else:
+                    new_session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    st.session_state.chat_sessions[new_session_id] = {
+                        "messages": [],
+                        "provider": provider_names[0] if provider_names else None,
+                        "model": None,
+                        "title": "新对话",
+                        "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    st.session_state.current_session_id = new_session_id
+
+            current_session = st.session_state.chat_sessions[st.session_state.current_session_id]
             
-            with main_col:
-                if not st.session_state.current_session_id or st.session_state.current_session_id not in st.session_state.chat_sessions:
-                    if st.session_state.chat_sessions:
-                        st.session_state.current_session_id = next(iter(st.session_state.chat_sessions.keys()))
-                    else:
-                        new_session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                        st.session_state.chat_sessions[new_session_id] = {
-                            "messages": [],
-                            "provider": provider_names[0] if provider_names else None,
-                            "model": None,
-                            "title": "新对话",
-                            "created_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        }
-                        st.session_state.current_session_id = new_session_id
+            st.markdown(f"### {current_session['title']}")
+            
+            provider_col, model_col = st.columns([1, 1])
+            with provider_col:
+                selected_provider_name = st.selectbox(
+                    "选择供应商",
+                    options=provider_names,
+                    key="selected_provider",
+                    index=provider_names.index(current_session["provider"]) if current_session["provider"] in provider_names else 0
+                )
+                if selected_provider_name != current_session["provider"]:
+                    current_session["provider"] = selected_provider_name
+                    current_session["model"] = None
 
-                current_session = st.session_state.chat_sessions[st.session_state.current_session_id]
-                
-                st.markdown(f"### {current_session['title']}")
-                
-                provider_col, model_col = st.columns([1, 1])
-                with provider_col:
-                    selected_provider_name = st.selectbox(
-                        "选择供应商",
-                        options=provider_names,
-                        key="selected_provider",
-                        index=provider_names.index(current_session["provider"]) if current_session["provider"] in provider_names else 0
+            selected_provider, selected_key = provider_to_key[selected_provider_name]
+            
+            cache_key = f"provider_models_{selected_provider.id}"
+            if cache_key not in st.session_state:
+                st.session_state[cache_key] = fetch_models(selected_provider.api_base, selected_key.key)
+            
+            provider_models = st.session_state[cache_key]
+            text_models = [m for m in provider_models if classify_model_type(m) == "text"]
+            
+            with model_col:
+                if text_models:
+                    selected_model = st.selectbox(
+                        "选择模型",
+                        options=text_models,
+                        key="selected_model",
+                        index=text_models.index(current_session["model"]) if current_session["model"] in text_models else 0
                     )
-                    if selected_provider_name != current_session["provider"]:
-                        current_session["provider"] = selected_provider_name
-                        current_session["model"] = None
+                    current_session["model"] = selected_model
+                else:
+                    st.warning("未获取到文本模型列表。")
+                    selected_model = None
 
-                selected_provider, selected_key = provider_to_key[selected_provider_name]
-                
-                cache_key = f"provider_models_{selected_provider.id}"
-                if cache_key not in st.session_state:
-                    st.session_state[cache_key] = fetch_models(selected_provider.api_base, selected_key.key)
-                
-                provider_models = st.session_state[cache_key]
-                text_models = [m for m in provider_models if classify_model_type(m) == "text"]
-                
-                with model_col:
-                    if text_models:
-                        selected_model = st.selectbox(
-                            "选择模型",
-                            options=text_models,
-                            key="selected_model",
-                            index=text_models.index(current_session["model"]) if current_session["model"] in text_models else 0
-                        )
-                        current_session["model"] = selected_model
-                    else:
-                        st.warning("未获取到文本模型列表。")
-                        selected_model = None
-
-                st.markdown("---")
-                
-                chat_container = st.container()
-                with chat_container:
-                    if not current_session["messages"]:
-                        st.markdown("""
-                        <div style="text-align: center; margin-top: 100px; color: #888;">
-                            <h2>👋 你好！</h2>
-                            <p>选择一个模型，开始与 AI 对话吧。</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        for msg in current_session["messages"]:
-                            if msg["role"] == "user":
-                                st.markdown(f"""
-                                <div class="user-message-container">
-                                    <div class="user-message">{msg['content']}</div>
+            st.markdown("---")
+            
+            chat_container = st.container()
+            with chat_container:
+                if not current_session["messages"]:
+                    st.markdown("""
+                    <div style="text-align: center; margin-top: 100px; color: #888;">
+                        <h2>👋 你好！</h2>
+                        <p>选择一个模型，开始与 AI 对话吧。</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    for msg in current_session["messages"]:
+                        if msg["role"] == "user":
+                            st.markdown(f"""
+                            <div class="user-message-container">
+                                <div class="user-message">{msg['content']}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        elif msg["role"] == "assistant":
+                            content = msg['content']
+                            thinking_content = None
+                            thinking_pattern = r'<thinking>([\s\S]*?)</thinking>'
+                            thinking_match = re.search(thinking_pattern, content)
+                            if thinking_match:
+                                thinking_content = thinking_match.group(1).strip()
+                                content = content[thinking_match.end():].strip()
+                            
+                            final_html = ""
+                            if thinking_content:
+                                thinking_id = f"thinking_{id(thinking_content)}"
+                                final_html += f"""
+                                <div class="thinking-block">
+                                    <div class="thinking-header" onclick="
+                                        var content = document.getElementById('{thinking_id}');
+                                        if (content.classList.contains('collapsed')) {{
+                                            content.classList.remove('collapsed');
+                                        }} else {{
+                                            content.classList.add('collapsed');
+                                        }}
+                                    ">
+                                        <span>🤔 思考过程</span>
+                                        <span>▼</span>
+                                    </div>
+                                    <div id="{thinking_id}" class="thinking-content collapsed">
+                                        <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{thinking_content}</pre>
+                                    </div>
                                 </div>
-                                """, unsafe_allow_html=True)
-                            elif msg["role"] == "assistant":
-                                content = msg['content']
-                                thinking_content = None
-                                thinking_pattern = r'<thinking>([\s\S]*?)</thinking>'
-                                thinking_match = re.search(thinking_pattern, content)
-                                if thinking_match:
-                                    thinking_content = thinking_match.group(1).strip()
-                                    content = content[thinking_match.end():].strip()
-                                
-                                final_html = ""
-                                if thinking_content:
-                                    thinking_id = f"thinking_{id(thinking_content)}"
+                                """
+                            
+                            parts = re.split(r'(```[\s\S]*?```)', content)
+                            for part in parts:
+                                if part.startswith('```') and part.endswith('```'):
+                                    code_content = part[3:-3].strip()
+                                    first_line_end = code_content.find('\n')
+                                    if first_line_end > 0:
+                                        language = code_content[:first_line_end].strip()
+                                        actual_code = code_content[first_line_end+1:]
+                                    else:
+                                        language = "code"
+                                        actual_code = code_content
+                                    
+                                    code_id = f"code_{id(actual_code)}"
                                     final_html += f"""
-                                    <div class="thinking-block">
-                                        <div class="thinking-header" onclick="
-                                            var content = document.getElementById('{thinking_id}');
-                                            if (content.classList.contains('collapsed')) {{
-                                                content.classList.remove('collapsed');
-                                            }} else {{
-                                                content.classList.add('collapsed');
-                                            }}
-                                        ">
-                                            <span>🤔 思考过程</span>
-                                            <span>▼</span>
+                                    <div class="code-block-container">
+                                        <div class="code-block-header">
+                                            <span>{language}</span>
+                                            <button class="copy-button" onclick="
+                                                var codeElement = document.getElementById('{code_id}');
+                                                var range = document.createRange();
+                                                range.selectNode(codeElement);
+                                                window.getSelection().removeAllRanges();
+                                                window.getSelection().addRange(range);
+                                                document.execCommand('copy');
+                                                window.getSelection().removeAllRanges();
+                                                this.textContent = '已复制!';
+                                                setTimeout(() => {{ this.textContent = '复制'; }}, 2000);
+                                            ">复制</button>
                                         </div>
-                                        <div id="{thinking_id}" class="thinking-content collapsed">
-                                            <pre style="white-space: pre-wrap; margin: 0; font-family: inherit;">{thinking_content}</pre>
+                                        <div class="code-block-content">
+                                            <pre id="{code_id}" style="margin: 0; white-space: pre-wrap;">{actual_code}</pre>
                                         </div>
                                     </div>
                                     """
-                                
-                                parts = re.split(r'(```[\s\S]*?```)', content)
-                                for part in parts:
-                                    if part.startswith('```') and part.endswith('```'):
-                                        code_content = part[3:-3].strip()
-                                        first_line_end = code_content.find('\n')
-                                        if first_line_end > 0:
-                                            language = code_content[:first_line_end].strip()
-                                            actual_code = code_content[first_line_end+1:]
-                                        else:
-                                            language = "code"
-                                            actual_code = code_content
-                                        
-                                        code_id = f"code_{id(actual_code)}"
-                                        final_html += f"""
-                                        <div class="code-block-container">
-                                            <div class="code-block-header">
-                                                <span>{language}</span>
-                                                <button class="copy-button" onclick="
-                                                    var codeElement = document.getElementById('{code_id}');
-                                                    var range = document.createRange();
-                                                    range.selectNode(codeElement);
-                                                    window.getSelection().removeAllRanges();
-                                                    window.getSelection().addRange(range);
-                                                    document.execCommand('copy');
-                                                    window.getSelection().removeAllRanges();
-                                                    this.textContent = '已复制!';
-                                                    setTimeout(() => {{ this.textContent = '复制'; }}, 2000);
-                                                ">复制</button>
-                                            </div>
-                                            <div class="code-block-content">
-                                                <pre id="{code_id}" style="margin: 0; white-space: pre-wrap;">{actual_code}</pre>
-                                            </div>
-                                        </div>
-                                        """
-                                    else:
-                                        if part.strip():
-                                            final_html += f"<p style='margin: 8px 0; white-space: pre-wrap;'>{part}</p>"
-                                
-                                st.markdown(f"""
-                                <div class="assistant-message-container">
-                                    <div class="assistant-message">{final_html}</div>
-                                </div>
-                                """, unsafe_allow_html=True)
+                                else:
+                                    if part.strip():
+                                        final_html += f"<p style='margin: 8px 0; white-space: pre-wrap;'>{part}</p>"
+                            
+                            st.markdown(f"""
+                            <div class="assistant-message-container">
+                                <div class="assistant-message">{final_html}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
 
-                st.markdown("---")
-                
-                user_input = st.chat_input("输入消息并回车发送...", key="main_chat_input")
-                
-                if user_input:
-                    if not selected_model:
-                        st.error("请先选择一个模型。")
-                    else:
-                        if not current_session["messages"]:
-                            current_session["title"] = user_input[:30] + ("..." if len(user_input) > 30 else "")
-                        
-                        current_session["messages"].append({"role": "user", "content": user_input})
-                        
-                        url = f"{selected_provider.api_base.rstrip('/')}/chat/completions"
-                        headers = {
-                            "Authorization": f"Bearer {selected_key.key}",
-                            "Content-Type": "application/json",
-                        }
-                        
-                        _send_messages = []
-                        _send_messages.extend(current_session["messages"])
-                        
-                        payload = {
-                            "model": selected_model,
-                            "messages": _send_messages,
-                            "max_tokens": 4096,
-                            "temperature": 0.7,
-                            "stream": True,
-                        }
-                        
-                        try:
-                            resp = requests.post(url, headers=headers, json=payload, timeout=120, stream=True)
-                            if resp.status_code == 200:
-                                collected_text = []
-                                usage_data = {}
+            st.markdown("---")
+            
+            user_input = st.chat_input("输入消息并回车发送...", key="main_chat_input")
+            
+            if user_input:
+                if not selected_model:
+                    st.error("请先选择一个模型。")
+                else:
+                    if not current_session["messages"]:
+                        current_session["title"] = user_input[:30] + ("..." if len(user_input) > 30 else "")
+                    
+                    current_session["messages"].append({"role": "user", "content": user_input})
+                    
+                    url = f"{selected_provider.api_base.rstrip('/')}/chat/completions"
+                    headers = {
+                        "Authorization": f"Bearer {selected_key.key}",
+                        "Content-Type": "application/json",
+                    }
+                    
+                    _send_messages = []
+                    _send_messages.extend(current_session["messages"])
+                    
+                    payload = {
+                        "model": selected_model,
+                        "messages": _send_messages,
+                        "max_tokens": 4096,
+                        "temperature": 0.7,
+                        "stream": True,
+                    }
+                    
+                    try:
+                        resp = requests.post(url, headers=headers, json=payload, timeout=120, stream=True)
+                        if resp.status_code == 200:
+                            collected_text = []
+                            usage_data = {}
+                            
+                            with st.chat_message("assistant"):
+                                placeholder = st.empty()
                                 
-                                with st.chat_message("assistant"):
-                                    placeholder = st.empty()
-                                    
-                                    for line in resp.iter_lines(decode_unicode=True):
-                                        if not line or not line.startswith("data: "):
-                                            continue
-                                        data_str = line[6:]
-                                        if data_str.strip() == "[DONE]":
-                                            break
-                                        try:
-                                            chunk = json.loads(data_str)
-                                            delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
-                                            content_piece = delta.get("content") or ""
-                                            if content_piece:
-                                                collected_text.append(content_piece)
-                                                placeholder.markdown("".join(collected_text) + "▌")
-                                            if chunk.get("usage"):
-                                                usage_data = chunk["usage"]
-                                        except (json.JSONDecodeError, Exception):
-                                            continue
-                                    
-                                    final_text = "".join(collected_text) or "(空响应)"
-                                    placeholder.markdown(final_text)
+                                for line in resp.iter_lines(decode_unicode=True):
+                                    if not line or not line.startswith("data: "):
+                                        continue
+                                    data_str = line[6:]
+                                    if data_str.strip() == "[DONE]":
+                                        break
+                                    try:
+                                        chunk = json.loads(data_str)
+                                        delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
+                                        content_piece = delta.get("content") or ""
+                                        if content_piece:
+                                            collected_text.append(content_piece)
+                                            placeholder.markdown("".join(collected_text) + "▌")
+                                        if chunk.get("usage"):
+                                            usage_data = chunk["usage"]
+                                    except (json.JSONDecodeError, Exception):
+                                        continue
                                 
-                                current_session["messages"].append({"role": "assistant", "content": final_text})
-                                
-                                ptk = (usage_data.get("prompt_tokens") or 0)
-                                ctk = (usage_data.get("completion_tokens") or 0)
-                                ttk = (usage_data.get("total_tokens") or (ptk + ctk))
-                                log_custom_usage(
-                                    key_id=selected_key.id,
-                                    model_name=selected_model,
-                                    prompt_tokens=ptk,
-                                    completion_tokens=ctk,
-                                    total_tokens=ttk,
-                                )
-                                
-                                st.rerun()
-                            else:
-                                st.error(f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}")
-                        except Exception as e:
-                            st.error(f"请求异常：{e}")
+                                final_text = "".join(collected_text) or "(空响应)"
+                                placeholder.markdown(final_text)
+                            
+                            current_session["messages"].append({"role": "assistant", "content": final_text})
+                            
+                            ptk = (usage_data.get("prompt_tokens") or 0)
+                            ctk = (usage_data.get("completion_tokens") or 0)
+                            ttk = (usage_data.get("total_tokens") or (ptk + ctk))
+                            log_custom_usage(
+                                key_id=selected_key.id,
+                                model_name=selected_model,
+                                prompt_tokens=ptk,
+                                completion_tokens=ctk,
+                                total_tokens=ttk,
+                            )
+                            
+                            st.rerun()
+                        else:
+                            st.error(f"请求失败：HTTP {resp.status_code}，{resp.text[:300]}")
+                    except Exception as e:
+                        st.error(f"请求异常：{e}")
