@@ -8,3 +8,5 @@ __pycache__/
 /credentials
 backups/
 .env
+.env
+.env
