@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import Session
 from db import SessionLocal, Provider, APIKey, ModelMapping, UsageLog, Base, ToolDefaultModel, SUPPORTED_PROVIDER_TYPES
@@ -142,7 +141,7 @@ def copy_button(label: str, value: str, key: str):
       }}
     </script>
     """
-    components.html(html, height=40)
+    st.iframe(html, height=40)
 
 
 def fetch_models(api_base, api_key):
