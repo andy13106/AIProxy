@@ -93,6 +93,32 @@ def ensure_sqlite_schema() -> None:
             "CREATE INDEX IF NOT EXISTS ix_playground_chat_messages_session_uid "
             "ON playground_chat_messages(session_uid)"
         )
+
+        # playground_chat_attachments 表
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS playground_chat_attachments (
+                id INTEGER PRIMARY KEY,
+                attachment_uid VARCHAR(80) UNIQUE NOT NULL,
+                message_id INTEGER,
+                session_uid VARCHAR(80) NOT NULL,
+                filename VARCHAR(255) NOT NULL,
+                file_path VARCHAR(500) NOT NULL,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                mime_type VARCHAR(100),
+                attachment_type VARCHAR(20) NOT NULL DEFAULT 'unknown',
+                created_at DATETIME
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_playground_chat_attachments_attachment_uid "
+            "ON playground_chat_attachments(attachment_uid)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_playground_chat_attachments_session_uid "
+            "ON playground_chat_attachments(session_uid)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -210,6 +236,20 @@ class PlaygroundChatMessage(Base):
     seq = Column(Integer, nullable=False)
     role = Column(String(20), nullable=False)
     content = Column(Text, nullable=True, default="")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class PlaygroundChatAttachment(Base):
+    __tablename__ = "playground_chat_attachments"
+    id = Column(Integer, primary_key=True)
+    attachment_uid = Column(String(80), unique=True, nullable=False, index=True)
+    message_id = Column(Integer, ForeignKey("playground_chat_messages.id"), nullable=True)
+    session_uid = Column(String(80), nullable=False, index=True)
+    filename = Column(String(255), nullable=False)
+    file_path = Column(String(500), nullable=False)
+    file_size = Column(Integer, nullable=False, default=0)
+    mime_type = Column(String(100), nullable=True)
+    attachment_type = Column(String(20), nullable=False, default="unknown")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 

@@ -1,8 +1,14 @@
+import base64
 import datetime
 import html
+import io
 import json
+import mimetypes
+import os
 import re
 import threading
+import uuid
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -10,6 +16,7 @@ import streamlit as st
 
 from db import (
     APIKey,
+    PlaygroundChatAttachment,
     PlaygroundChatMessage,
     PlaygroundChatSession,
     Provider,
@@ -20,6 +27,101 @@ from utils import classify_model_type, fetch_models, log_custom_usage
 
 _WORKER_LOCK = threading.Lock()
 _WORKER_THREADS: dict[str, threading.Thread] = {}
+_WORKER_STOP_FLAGS: dict[str, bool] = {}
+
+
+_DATA_DIR = Path(__file__).parent / "data" / "attachments"
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+SUPPORTED_ATTACHMENT_TYPES = {
+    "image": {
+        "extensions": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"},
+        "mime_types": {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"},
+    },
+    "document": {
+        "extensions": {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".md"},
+        "mime_types": {
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "text/plain",
+            "text/csv",
+            "text/markdown",
+        },
+    },
+}
+
+
+def _save_attachment(file_data: bytes, filename: str, mime_type: str) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    attachment_id = str(uuid.uuid4())
+    saved_filename = f"{attachment_id}{ext}"
+    file_path = _DATA_DIR / saved_filename
+
+    with open(file_path, "wb") as f:
+        f.write(file_data)
+
+    attachment_type = "unknown"
+    if mime_type.startswith("image/") or ext in SUPPORTED_ATTACHMENT_TYPES["image"]["extensions"]:
+        attachment_type = "image"
+    elif ext in SUPPORTED_ATTACHMENT_TYPES["document"]["extensions"]:
+        attachment_type = "document"
+
+    with SessionLocal() as session:
+        db_attachment = PlaygroundChatAttachment(
+            attachment_uid=attachment_id,
+            filename=filename,
+            file_path=str(file_path),
+            file_size=len(file_data),
+            mime_type=mime_type,
+            attachment_type=attachment_type,
+        )
+        session.add(db_attachment)
+        session.commit()
+
+    return attachment_id
+
+
+def _get_attachment_data(attachment_id: str) -> dict[str, Any] | None:
+    with SessionLocal() as session:
+        db_attachment = session.query(PlaygroundChatAttachment).filter(
+            PlaygroundChatAttachment.attachment_uid == attachment_id
+        ).first()
+        if db_attachment is None:
+            return None
+        return {
+            "id": db_attachment.attachment_uid,
+            "filename": db_attachment.filename,
+            "file_path": db_attachment.file_path,
+            "file_size": db_attachment.file_size,
+            "mime_type": db_attachment.mime_type,
+            "attachment_type": db_attachment.attachment_type,
+        }
+
+
+def _encode_image_to_base64(file_path: str) -> str:
+    with open(file_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _stop_stream_worker(session_id: str) -> None:
+    with _WORKER_LOCK:
+        _WORKER_STOP_FLAGS[session_id] = True
+
+
+def _clear_stop_flag(session_id: str) -> None:
+    with _WORKER_LOCK:
+        _WORKER_STOP_FLAGS.pop(session_id, None)
+
+
+def _should_stop(session_id: str) -> bool:
+    with _WORKER_LOCK:
+        return _WORKER_STOP_FLAGS.get(session_id, False)
 
 
 THINKING_PATTERN = re.compile(r"<thinking>([\s\S]*?)</thinking>", re.IGNORECASE)
@@ -34,6 +136,7 @@ def _ensure_state(provider_names: list[str]) -> None:
             "input_history": [],
             "models_cache": {},
             "loaded_from_db": False,
+            "pending_attachments": [],
         }
 
     state = st.session_state.playground_state
@@ -196,14 +299,50 @@ def _format_title(messages: list[dict[str, Any]]) -> str:
     return "新对话"
 
 
-def _build_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
-    payload_messages: list[dict[str, str]] = []
+def _build_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payload_messages: list[dict[str, Any]] = []
     for msg in messages:
         role = msg.get("role")
         if role not in {"user", "assistant", "system"}:
             continue
-        content = str(msg.get("content") or "")
-        payload_messages.append({"role": role, "content": content})
+
+        attachments = msg.get("attachments", [])
+        text_content = str(msg.get("content") or "")
+
+        if not attachments:
+            payload_messages.append({"role": role, "content": text_content})
+            continue
+
+        content_parts = []
+        if text_content.strip():
+            content_parts.append({"type": "text", "text": text_content})
+
+        for att in attachments:
+            att_data = _get_attachment_data(att.get("id"))
+            if not att_data:
+                continue
+
+            att_type = att_data.get("attachment_type")
+            if att_type == "image":
+                base64_data = _encode_image_to_base64(att_data["file_path"])
+                mime_type = att_data.get("mime_type") or "image/jpeg"
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{base64_data}"
+                    }
+                })
+            else:
+                if text_content.strip():
+                    text_content += f"\n\n[附件: {att_data.get('filename')}]"
+                else:
+                    text_content = f"[附件: {att_data.get('filename')}]"
+
+        if content_parts:
+            payload_messages.append({"role": role, "content": content_parts})
+        else:
+            payload_messages.append({"role": role, "content": text_content or ""})
+
     return payload_messages
 
 
@@ -213,11 +352,13 @@ def _start_stream_worker(
     provider: Provider,
     key: APIKey,
     model_name: str,
-    payload_messages: list[dict[str, str]],
+    payload_messages: list[dict[str, Any]],
 ) -> None:
     def run_stream() -> None:
         usage_data: dict[str, Any] = {}
+        stopped = False
         try:
+            _clear_stop_flag(session_id)
             url = f"{provider.api_base.rstrip('/')}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {key.key}",
@@ -259,6 +400,10 @@ def _start_stream_worker(
                 return
 
             for line in resp.iter_lines(decode_unicode=True):
+                if _should_stop(session_id):
+                    stopped = True
+                    break
+
                 if not line or not line.startswith("data: "):
                     continue
                 chunk_data = line[6:]
@@ -290,22 +435,31 @@ def _start_stream_worker(
                 if session is None:
                     return
                 stream_idx = session.get("streaming_index")
-                if stream_idx is not None and 0 <= stream_idx < len(session["messages"]):
-                    if not session["messages"][stream_idx].get("content"):
-                        session["messages"][stream_idx]["content"] = "(空响应)"
+                if stopped:
+                    if stream_idx is not None and 0 <= stream_idx < len(session["messages"]):
+                        existing_content = session["messages"][stream_idx].get("content") or ""
+                        if existing_content:
+                            session["messages"][stream_idx]["content"] = existing_content + "\n\n[用户已停止生成]"
+                        else:
+                            session["messages"][stream_idx]["content"] = "[用户已停止生成]"
+                else:
+                    if stream_idx is not None and 0 <= stream_idx < len(session["messages"]):
+                        if not session["messages"][stream_idx].get("content"):
+                            session["messages"][stream_idx]["content"] = "(空响应)"
                 session["is_streaming"] = False
                 session["streaming_index"] = None
 
-            prompt_tokens = usage_data.get("prompt_tokens") or 0
-            completion_tokens = usage_data.get("completion_tokens") or 0
-            total_tokens = usage_data.get("total_tokens") or (prompt_tokens + completion_tokens)
-            log_custom_usage(
-                key_id=key.id,
-                model_name=model_name,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-            )
+            if not stopped:
+                prompt_tokens = usage_data.get("prompt_tokens") or 0
+                completion_tokens = usage_data.get("completion_tokens") or 0
+                total_tokens = usage_data.get("total_tokens") or (prompt_tokens + completion_tokens)
+                log_custom_usage(
+                    key_id=key.id,
+                    model_name=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                )
             with _WORKER_LOCK:
                 session = state["sessions"].get(session_id)
                 if session is not None:
@@ -350,6 +504,7 @@ def _start_stream_worker(
         finally:
             with _WORKER_LOCK:
                 _WORKER_THREADS.pop(session_id, None)
+                _WORKER_STOP_FLAGS.pop(session_id, None)
 
     with _WORKER_LOCK:
         existing = _WORKER_THREADS.get(session_id)
@@ -360,16 +515,71 @@ def _start_stream_worker(
         worker.start()
 
 
-def _render_user_message(content: str) -> None:
+def _format_file_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _render_user_message(content: str, attachments: list[dict[str, Any]] | None = None) -> None:
     safe_text = html.escape(content or "")
-    st.markdown(
-        f"""
-        <div class="chat-row chat-row-user">
-            <div class="chat-bubble chat-bubble-user">{safe_text}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    attachment_parts = []
+
+    if attachments:
+        for att in attachments:
+            att_data = _get_attachment_data(att.get("id"))
+            if not att_data:
+                continue
+
+            filename = att_data.get("filename", "未知文件")
+            file_size = att_data.get("file_size", 0)
+            att_type = att_data.get("attachment_type", "unknown")
+            file_path = att_data.get("file_path")
+
+            size_str = _format_file_size(file_size)
+            icon = "📄"
+            if att_type == "image":
+                icon = "🖼️"
+            elif filename.lower().endswith(".pdf"):
+                icon = "📕"
+            elif filename.lower().endswith((".doc", ".docx")):
+                icon = "📘"
+            elif filename.lower().endswith((".xls", ".xlsx")):
+                icon = "📗"
+            elif filename.lower().endswith((".ppt", ".pptx")):
+                icon = "📙"
+
+            if att_type == "image" and file_path and os.path.exists(file_path):
+                try:
+                    st.image(file_path, caption=filename, width=200)
+                except Exception:
+                    attachment_parts.append(
+                        f'<div class="attachment-item">{icon} <span class="attachment-name">{html.escape(filename)}</span> <span class="attachment-size">({size_str})</span></div>'
+                    )
+            else:
+                attachment_parts.append(
+                    f'<div class="attachment-item">{icon} <span class="attachment-name">{html.escape(filename)}</span> <span class="attachment-size">({size_str})</span></div>'
+                )
+
+    if safe_text or attachment_parts:
+        content_html = f'<div class="chat-bubble chat-bubble-user">'
+        if safe_text:
+            content_html += f'<div class="message-text">{safe_text}</div>'
+        if attachment_parts:
+            content_html += f'<div class="attachments-list">{"".join(attachment_parts)}</div>'
+        content_html += "</div>"
+
+        st.markdown(
+            f"""
+            <div class="chat-row chat-row-user">
+                {content_html}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
@@ -415,6 +625,7 @@ def _render_messages(messages: list[dict[str, Any]], current_session_streaming: 
             <div class="chat-empty-state">
                 <h3>开始一个新对话</h3>
                 <p>在下方输入框发送消息，支持流式回复、代码块和思考折叠。</p>
+                <p>支持添加图片、文档等附件，可拖拽文件到界面添加。</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -424,8 +635,9 @@ def _render_messages(messages: list[dict[str, Any]], current_session_streaming: 
     for idx, msg in enumerate(messages):
         role = msg.get("role")
         content = msg.get("content") or ""
+        attachments = msg.get("attachments", [])
         if role == "user":
-            _render_user_message(content)
+            _render_user_message(content, attachments)
         elif role == "assistant":
             is_streaming = current_session_streaming and idx == len(messages) - 1
             if is_streaming and not str(content).strip():
@@ -547,6 +759,60 @@ def _apply_page_style() -> None:
             color: #93c5fd;
             background: rgba(29, 78, 216, 0.28);
         }
+        .attachments-list {
+            margin-top: 0.5rem;
+            padding-top: 0.5rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .attachment-item {
+            display: flex;
+            align-items: center;
+            padding: 0.4rem 0.6rem;
+            margin-bottom: 0.3rem;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            font-size: 0.9rem;
+        }
+        .attachment-name {
+            margin-left: 0.5rem;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .attachment-size {
+            margin-left: 0.5rem;
+            opacity: 0.8;
+            font-size: 0.8rem;
+        }
+        .message-text {
+            margin-bottom: 0.3rem;
+        }
+        .attachment-preview-container {
+            margin-top: 0.5rem;
+            padding: 0.5rem;
+            background: rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+        }
+        .attachment-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.2rem 0.5rem;
+            margin-right: 0.3rem;
+            margin-bottom: 0.3rem;
+            background: rgba(59, 130, 246, 0.2);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            border-radius: 4px;
+            font-size: 0.8rem;
+        }
+        .attachment-badge .remove-btn {
+            margin-left: 0.4rem;
+            cursor: pointer;
+            opacity: 0.7;
+        }
+        .attachment-badge .remove-btn:hover {
+            opacity: 1;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -572,14 +838,14 @@ def _render_session_panel(
         current_session["model"] = text_models[0] if text_models else None
 
     st.markdown("### 模型体验")
-    st.caption("底部输入，支持流式回复。切换历史对话时，后台生成会持续进行。")
+    st.caption("底部输入，支持流式回复。切换历史对话时，后台生成会持续进行。支持添加图片、文档等附件。")
 
     with _WORKER_LOCK:
         message_snapshot = [dict(item) for item in current_session["messages"]]
         current_streaming = bool(current_session.get("is_streaming", False))
 
 
-    chat_scroll = st.container(height=610, key="pg_chat_scroll", autoscroll=True)
+    chat_scroll = st.container(height=560, key="pg_chat_scroll", autoscroll=True)
     with chat_scroll:
         _render_messages(message_snapshot, current_streaming)
 
@@ -622,18 +888,73 @@ def _render_session_panel(
 
         with config_col3:
             if current_streaming:
-                st.markdown('<div class="status-pill streaming">生成中</div>', unsafe_allow_html=True)
+                if st.button("⏹ 停止", key=f"stop_btn_{current_session_id}", use_container_width=True, type="primary"):
+                    _stop_stream_worker(current_session_id)
+                    st.rerun()
             else:
                 st.markdown('<div class="status-pill idle">空闲</div>', unsafe_allow_html=True)
 
+        pending_attachments = state.get("pending_attachments", [])
+        if pending_attachments:
+            attachment_col1, attachment_col2 = st.columns([10, 2])
+            with attachment_col1:
+                badge_html_parts = []
+                for idx, att in enumerate(pending_attachments):
+                    att_data = _get_attachment_data(att.get("id"))
+                    if att_data:
+                        filename = att_data.get("filename", "未知文件")
+                        icon = "🖼️" if att_data.get("attachment_type") == "image" else "📄"
+                        badge_html_parts.append(
+                            f'<span class="attachment-badge">{icon} {html.escape(filename)[:25]}</span>'
+                        )
+                if badge_html_parts:
+                    st.markdown(
+                        f'<div class="attachment-preview-container">{"".join(badge_html_parts)}</div>',
+                        unsafe_allow_html=True,
+                    )
+            with attachment_col2:
+                if st.button("清空附件", key=f"clear_attachments_{current_session_id}", use_container_width=True):
+                    state["pending_attachments"] = []
+                    st.rerun()
+
         with st.form(key=f"chat_form_{current_session_id}", clear_on_submit=True, border=False):
-            input_col, send_col = st.columns([12, 1.6])
+            attach_col, input_col, send_col = st.columns([1, 11, 1.6])
+            with attach_col:
+                uploaded_files = st.file_uploader(
+                    "📎",
+                    type=["jpg", "jpeg", "png", "gif", "webp", "bmp", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "md"],
+                    key=f"file_uploader_{current_session_id}",
+                    accept_multiple_files=True,
+                    label_visibility="collapsed",
+                )
+                if uploaded_files:
+                    for uploaded_file in uploaded_files:
+                        file_bytes = uploaded_file.read()
+                        filename = uploaded_file.name
+                        mime_type = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+                        existing_ids = {a.get("id") for a in state.get("pending_attachments", [])}
+                        already_exists = False
+                        for existing in state.get("pending_attachments", []):
+                            existing_data = _get_attachment_data(existing.get("id"))
+                            if existing_data and existing_data.get("filename") == filename and existing_data.get("file_size") == len(file_bytes):
+                                already_exists = True
+                                break
+                        if already_exists:
+                            continue
+
+                        att_id = _save_attachment(file_bytes, filename, mime_type)
+                        if "pending_attachments" not in state:
+                            state["pending_attachments"] = []
+                        state["pending_attachments"].append({"id": att_id})
+                    st.rerun()
+
             with input_col:
                 prompt = st.text_input(
                     "输入消息",
                     key=f"chat_input_{current_session_id}",
                     label_visibility="collapsed",
-                    placeholder="输入消息（Enter 发送）",
+                    placeholder="输入消息（可添加附件）",
                     disabled=current_streaming or not bool(current_session.get("model")),
                 )
             with send_col:
@@ -643,44 +964,67 @@ def _render_session_panel(
                     disabled=current_streaming or not bool(current_session.get("model")),
                 )
 
-        if submitted and prompt:
-            if not current_session.get("model"):
+        if submitted:
+            pending_attachments = state.get("pending_attachments", [])
+            has_content = bool(prompt and prompt.strip()) or bool(pending_attachments)
+
+            if not has_content:
+                st.warning("请输入消息或添加附件。")
+            elif not current_session.get("model"):
                 st.warning("请先选择模型。")
             else:
-                text = prompt.strip()
+                text = prompt.strip() if prompt else ""
                 if text:
                     state["input_history"].append(text)
-                    current_session["messages"].append({"role": "user", "content": text})
-                    current_session["messages"].append({"role": "assistant", "content": ""})
-                    current_session["is_streaming"] = True
-                    current_session["streaming_index"] = len(current_session["messages"]) - 1
-                    current_session["title"] = _format_title(current_session["messages"])
-                    user_idx = len(current_session["messages"]) - 2
-                    assistant_idx = len(current_session["messages"]) - 1
-                    _upsert_session_to_db(current_session)
-                    _upsert_message_to_db(
-                        session_uid=current_session_id,
-                        seq=user_idx,
-                        role="user",
-                        content=text,
-                    )
-                    _upsert_message_to_db(
-                        session_uid=current_session_id,
-                        seq=assistant_idx,
-                        role="assistant",
-                        content="",
-                    )
 
-                    payload_messages = _build_api_messages(current_session["messages"][:-1])
-                    _start_stream_worker(
-                        state=state,
-                        session_id=current_session_id,
-                        provider=selected_provider,
-                        key=selected_key,
-                        model_name=current_session["model"],
-                        payload_messages=payload_messages,
-                    )
-                    st.rerun()
+                user_message = {
+                    "role": "user",
+                    "content": text,
+                }
+                if pending_attachments:
+                    user_message["attachments"] = [dict(a) for a in pending_attachments]
+                    for att in pending_attachments:
+                        with SessionLocal() as session:
+                            db_attachment = session.query(PlaygroundChatAttachment).filter(
+                                PlaygroundChatAttachment.attachment_uid == att.get("id")
+                            ).first()
+                            if db_attachment:
+                                db_attachment.session_uid = current_session_id
+                                session.commit()
+
+                current_session["messages"].append(user_message)
+                current_session["messages"].append({"role": "assistant", "content": ""})
+                current_session["is_streaming"] = True
+                current_session["streaming_index"] = len(current_session["messages"]) - 1
+                current_session["title"] = _format_title(current_session["messages"])
+                user_idx = len(current_session["messages"]) - 2
+                assistant_idx = len(current_session["messages"]) - 1
+                _upsert_session_to_db(current_session)
+                _upsert_message_to_db(
+                    session_uid=current_session_id,
+                    seq=user_idx,
+                    role="user",
+                    content=text,
+                )
+                _upsert_message_to_db(
+                    session_uid=current_session_id,
+                    seq=assistant_idx,
+                    role="assistant",
+                    content="",
+                )
+
+                state["pending_attachments"] = []
+
+                payload_messages = _build_api_messages(current_session["messages"][:-1])
+                _start_stream_worker(
+                    state=state,
+                    session_id=current_session_id,
+                    provider=selected_provider,
+                    key=selected_key,
+                    model_name=current_session["model"],
+                    payload_messages=payload_messages,
+                )
+                st.rerun()
 
 
 def render_playground_page() -> None:
