@@ -894,9 +894,11 @@ def _render_session_panel(
             else:
                 st.markdown('<div class="status-pill idle">空闲</div>', unsafe_allow_html=True)
 
-        pending_attachments = state.get("pending_attachments", [])
+        # 获取当前待发送的附件
+        def get_pending_attachments():
+            return state.get("pending_attachments", [])
 
-        # 文件上传区域（在 form 外部）
+        # 文件上传区域
         upload_col1, upload_col2 = st.columns([10, 2])
         with upload_col1:
             uploaded_files = st.file_uploader(
@@ -906,35 +908,57 @@ def _render_session_panel(
                 accept_multiple_files=True,
                 label_visibility="visible",
             )
-            if uploaded_files:
-                for uploaded_file in uploaded_files:
-                    file_bytes = uploaded_file.read()
-                    filename = uploaded_file.name
-                    mime_type = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-                    # 检查是否已存在相同的附件
+            # 处理上传的文件
+            if uploaded_files:
+                # 使用文件的唯一标识来避免重复处理
+                for uploaded_file in uploaded_files:
+                    filename = uploaded_file.name
+                    # 使用 uploaded_file.size 来获取文件大小（如果可用）
+                    try:
+                        file_size = uploaded_file.size
+                    except AttributeError:
+                        # 如果 size 属性不可用，读取文件来获取大小
+                        file_bytes = uploaded_file.read()
+                        file_size = len(file_bytes)
+                        # 重置文件指针
+                        uploaded_file.seek(0)
+
+                    # 创建文件的唯一标识（文件名 + 大小）
+                    file_identifier = f"{filename}_{file_size}"
+
+                    # 检查是否已存在于待发送列表中（避免重复添加）
                     already_exists = False
-                    for existing in state.get("pending_attachments", []):
+                    for existing in get_pending_attachments():
                         existing_data = _get_attachment_data(existing.get("id"))
-                        if existing_data and existing_data.get("filename") == filename and existing_data.get("file_size") == len(file_bytes):
+                        if existing_data and existing_data.get("filename") == filename and existing_data.get("file_size") == file_size:
                             already_exists = True
                             break
-                    if already_exists:
-                        continue
 
-                    att_id = _save_attachment(file_bytes, filename, mime_type)
-                    if "pending_attachments" not in state:
-                        state["pending_attachments"] = []
-                    state["pending_attachments"].append({"id": att_id})
-                st.rerun()
+                    if not already_exists:
+                        # 读取文件内容
+                        try:
+                            # 如果之前已经读取过，需要重置文件指针
+                            uploaded_file.seek(0)
+                        except Exception:
+                            pass
+                        file_bytes = uploaded_file.read()
+                        mime_type = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+                        # 保存附件
+                        att_id = _save_attachment(file_bytes, filename, mime_type)
+                        if "pending_attachments" not in state:
+                            state["pending_attachments"] = []
+                        state["pending_attachments"].append({"id": att_id})
 
         # 附件预览区域
-        if pending_attachments:
+        current_pending = get_pending_attachments()
+        if current_pending:
             preview_col1, preview_col2 = st.columns([10, 2])
             with preview_col1:
                 st.caption("已添加的附件：")
                 badge_html_parts = []
-                for idx, att in enumerate(pending_attachments):
+                for idx, att in enumerate(current_pending):
                     att_data = _get_attachment_data(att.get("id"))
                     if att_data:
                         filename = att_data.get("filename", "未知文件")
