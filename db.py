@@ -95,22 +95,67 @@ def ensure_sqlite_schema() -> None:
         )
 
         # playground_chat_attachments 表
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS playground_chat_attachments (
-                id INTEGER PRIMARY KEY,
-                attachment_uid VARCHAR(80) UNIQUE NOT NULL,
-                message_id INTEGER,
-                session_uid VARCHAR(80) NOT NULL,
-                filename VARCHAR(255) NOT NULL,
-                file_path VARCHAR(500) NOT NULL,
-                file_size INTEGER NOT NULL DEFAULT 0,
-                mime_type VARCHAR(100),
-                attachment_type VARCHAR(20) NOT NULL DEFAULT 'unknown',
-                created_at DATETIME
+        # 检查现有表结构，处理 session_uid 的 NOT NULL 约束
+        cur.execute("PRAGMA table_info(playground_chat_attachments)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+
+        if not existing_cols:
+            # 表不存在，直接创建新表（session_uid 允许 NULL）
+            cur.execute(
+                """
+                CREATE TABLE playground_chat_attachments (
+                    id INTEGER PRIMARY KEY,
+                    attachment_uid VARCHAR(80) UNIQUE NOT NULL,
+                    message_id INTEGER,
+                    session_uid VARCHAR(80),
+                    filename VARCHAR(255) NOT NULL,
+                    file_path VARCHAR(500) NOT NULL,
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    mime_type VARCHAR(100),
+                    attachment_type VARCHAR(20) NOT NULL DEFAULT 'unknown',
+                    created_at DATETIME
+                )
+                """
             )
-            """
-        )
+        else:
+            # 表已存在，检查 session_uid 是否允许 NULL
+            # SQLite 不支持直接修改列，需要创建新表迁移
+            cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='playground_chat_attachments'")
+            table_sql = cur.fetchone()
+            if table_sql and "session_uid VARCHAR(80) NOT NULL" in table_sql[0]:
+                # 需要迁移，session_uid 是 NOT NULL
+                cur.execute(
+                    """
+                    CREATE TABLE playground_chat_attachments_new (
+                        id INTEGER PRIMARY KEY,
+                        attachment_uid VARCHAR(80) UNIQUE NOT NULL,
+                        message_id INTEGER,
+                        session_uid VARCHAR(80),
+                        filename VARCHAR(255) NOT NULL,
+                        file_path VARCHAR(500) NOT NULL,
+                        file_size INTEGER NOT NULL DEFAULT 0,
+                        mime_type VARCHAR(100),
+                        attachment_type VARCHAR(20) NOT NULL DEFAULT 'unknown',
+                        created_at DATETIME
+                    )
+                    """
+                )
+                # 复制数据
+                cur.execute(
+                    """
+                    INSERT INTO playground_chat_attachments_new 
+                    (id, attachment_uid, message_id, session_uid, filename, file_path, 
+                     file_size, mime_type, attachment_type, created_at)
+                    SELECT id, attachment_uid, message_id, session_uid, filename, file_path,
+                           file_size, mime_type, attachment_type, created_at
+                    FROM playground_chat_attachments
+                    """
+                )
+                # 删除旧表，重命名新表
+                cur.execute("DROP TABLE playground_chat_attachments")
+                cur.execute("ALTER TABLE playground_chat_attachments_new RENAME TO playground_chat_attachments")
+
+        # 创建索引
         cur.execute(
             "CREATE INDEX IF NOT EXISTS ix_playground_chat_attachments_attachment_uid "
             "ON playground_chat_attachments(attachment_uid)"
@@ -244,7 +289,7 @@ class PlaygroundChatAttachment(Base):
     id = Column(Integer, primary_key=True)
     attachment_uid = Column(String(80), unique=True, nullable=False, index=True)
     message_id = Column(Integer, ForeignKey("playground_chat_messages.id"), nullable=True)
-    session_uid = Column(String(80), nullable=False, index=True)
+    session_uid = Column(String(80), nullable=True, index=True)
     filename = Column(String(255), nullable=False)
     file_path = Column(String(500), nullable=False)
     file_size = Column(Integer, nullable=False, default=0)

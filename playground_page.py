@@ -895,66 +895,74 @@ def _render_session_panel(
                 st.markdown('<div class="status-pill idle">空闲</div>', unsafe_allow_html=True)
 
         pending_attachments = state.get("pending_attachments", [])
+
+        # 文件上传区域（在 form 外部）
+        upload_col1, upload_col2 = st.columns([10, 2])
+        with upload_col1:
+            uploaded_files = st.file_uploader(
+                "添加附件（支持拖拽上传）",
+                type=["jpg", "jpeg", "png", "gif", "webp", "bmp", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "md"],
+                key=f"file_uploader_{current_session_id}",
+                accept_multiple_files=True,
+                label_visibility="visible",
+            )
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    file_bytes = uploaded_file.read()
+                    filename = uploaded_file.name
+                    mime_type = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+                    # 检查是否已存在相同的附件
+                    already_exists = False
+                    for existing in state.get("pending_attachments", []):
+                        existing_data = _get_attachment_data(existing.get("id"))
+                        if existing_data and existing_data.get("filename") == filename and existing_data.get("file_size") == len(file_bytes):
+                            already_exists = True
+                            break
+                    if already_exists:
+                        continue
+
+                    att_id = _save_attachment(file_bytes, filename, mime_type)
+                    if "pending_attachments" not in state:
+                        state["pending_attachments"] = []
+                    state["pending_attachments"].append({"id": att_id})
+                st.rerun()
+
+        # 附件预览区域
         if pending_attachments:
-            attachment_col1, attachment_col2 = st.columns([10, 2])
-            with attachment_col1:
+            preview_col1, preview_col2 = st.columns([10, 2])
+            with preview_col1:
+                st.caption("已添加的附件：")
                 badge_html_parts = []
                 for idx, att in enumerate(pending_attachments):
                     att_data = _get_attachment_data(att.get("id"))
                     if att_data:
                         filename = att_data.get("filename", "未知文件")
+                        file_size = att_data.get("file_size", 0)
+                        size_str = _format_file_size(file_size)
                         icon = "🖼️" if att_data.get("attachment_type") == "image" else "📄"
                         badge_html_parts.append(
-                            f'<span class="attachment-badge">{icon} {html.escape(filename)[:25]}</span>'
+                            f'<span class="attachment-badge">{icon} {html.escape(filename)[:25]} ({size_str})</span>'
                         )
                 if badge_html_parts:
                     st.markdown(
                         f'<div class="attachment-preview-container">{"".join(badge_html_parts)}</div>',
                         unsafe_allow_html=True,
                     )
-            with attachment_col2:
+            with preview_col2:
+                st.write("")
                 if st.button("清空附件", key=f"clear_attachments_{current_session_id}", use_container_width=True):
                     state["pending_attachments"] = []
                     st.rerun()
 
         with st.form(key=f"chat_form_{current_session_id}", clear_on_submit=True, border=False):
-            attach_col, input_col, send_col = st.columns([1, 11, 1.6])
-            with attach_col:
-                uploaded_files = st.file_uploader(
-                    "📎",
-                    type=["jpg", "jpeg", "png", "gif", "webp", "bmp", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "md"],
-                    key=f"file_uploader_{current_session_id}",
-                    accept_multiple_files=True,
-                    label_visibility="collapsed",
-                )
-                if uploaded_files:
-                    for uploaded_file in uploaded_files:
-                        file_bytes = uploaded_file.read()
-                        filename = uploaded_file.name
-                        mime_type = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-                        existing_ids = {a.get("id") for a in state.get("pending_attachments", [])}
-                        already_exists = False
-                        for existing in state.get("pending_attachments", []):
-                            existing_data = _get_attachment_data(existing.get("id"))
-                            if existing_data and existing_data.get("filename") == filename and existing_data.get("file_size") == len(file_bytes):
-                                already_exists = True
-                                break
-                        if already_exists:
-                            continue
-
-                        att_id = _save_attachment(file_bytes, filename, mime_type)
-                        if "pending_attachments" not in state:
-                            state["pending_attachments"] = []
-                        state["pending_attachments"].append({"id": att_id})
-                    st.rerun()
-
+            input_col, send_col = st.columns([12, 1.6])
             with input_col:
                 prompt = st.text_input(
                     "输入消息",
                     key=f"chat_input_{current_session_id}",
                     label_visibility="collapsed",
-                    placeholder="输入消息（可添加附件）",
+                    placeholder="输入消息（可添加附件后一起发送）",
                     disabled=current_streaming or not bool(current_session.get("model")),
                 )
             with send_col:
