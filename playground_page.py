@@ -586,25 +586,35 @@ def _render_user_message(content: str, attachments: list[dict[str, Any]] | None 
 
     parts = []
     if file_badges:
-        parts.append(f'<div class="msg-files">{"".join(file_badges)}</div>')
+        parts.append(f'<div class="msg-files">{" ".join(file_badges)}</div>')
     if safe_text:
         parts.append(f'<div class="chat-bubble chat-bubble-user"><div class="message-text">{safe_text}</div></div>')
 
     if parts:
         st.markdown(
-            f'<div class="chat-row chat-row-user">{"".join(parts)}</div>',
+            '<div class="chat-row chat-row-user">'
+            '<div class="role-icon user">U</div>'
+            '<div class="chat-content">'
+            '<div class="chat-meta">You</div>'
+            + " ".join(parts) +
+            '</div>'
+            '</div>',
             unsafe_allow_html=True,
         )
 
 
 def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
-    st.markdown(
-        '<div class="chat-meta"><div class="role-icon assistant">AI</div> <span>Assistant</span></div>',
-        unsafe_allow_html=True,
-    )
     text = content or ""
     thinking_parts = THINKING_PATTERN.findall(text)
     content_without_thinking = THINKING_PATTERN.sub("", text).strip()
+
+    st.markdown(
+        '<div class="chat-row chat-row-assistant">'
+        '<div class="role-icon assistant">AI</div>'
+        '<div class="chat-content">'
+        '<div class="chat-meta">Assistant</div>',
+        unsafe_allow_html=True,
+    )
 
     for idx, think in enumerate(thinking_parts):
         with st.expander(f"思考过程 #{idx + 1}", expanded=False):
@@ -612,6 +622,7 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
 
     if not content_without_thinking and is_streaming:
         st.markdown('<span class="chat-stream-cursor">▌</span>', unsafe_allow_html=True)
+        st.markdown('</div></div>', unsafe_allow_html=True)
         return
 
     st.markdown('<div class="chat-bubble chat-bubble-assistant">', unsafe_allow_html=True)
@@ -632,7 +643,7 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
         tail = content_without_thinking[cursor:]
         if tail.strip() or is_streaming:
             st.markdown(tail + (" ▌" if is_streaming else ""))
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div></div></div>', unsafe_allow_html=True)
 
 def _render_error_message(content: str) -> None:
     st.error(content or "未知错误")
@@ -677,11 +688,43 @@ def _apply_page_style() -> None:
     st.markdown(
         """
         <style>
+        /* ── Light mode (default) — warm gold-tinted palette from Hermes brand ── */
+        :root {
+            --bg:#FEFCF7;--sidebar:#FAF7F0;--border:#E0D8C8;--border2:rgba(0,0,0,0.15);
+            --text:#1A1610;--muted:#5C5344;--accent:#B8860B;--blue:#0288A8;--gold:#8B6508;--code-bg:#F5F0E5;
+            --surface:#F3EEE3;--topbar-bg:rgba(250,247,240,.98);--main-bg:rgba(254,252,247,0.5);
+            --focus-ring:rgba(184,134,11,.35);--focus-glow:rgba(184,134,11,.1);
+            --input-bg:rgba(0,0,0,.03);--hover-bg:rgba(0,0,0,.05);
+            --strong:#0F0D08;--em:#5C5344;--code-text:#8b4513;--code-inline-bg:rgba(0,0,0,.06);--pre-text:#1A1610;
+            --accent-hover:#996F08;--accent-bg:rgba(184,134,11,0.08);--accent-bg-strong:rgba(184,134,11,0.15);--accent-text:#8B6508;
+            --error:#C62828;--success:#3D8B40;--warning:#E68A00;--info:#0288A8;
+            font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-size:14px;line-height:1.6;
+        }
+        
+        /* ── Dark mode — navy-black + gold accent matching Hermes terminal ── */
+        :root.dark {
+            --bg:#0D0D1A;--sidebar:#141425;--border:#2A2A45;--border2:rgba(255,255,255,0.14);
+            --text:#FFF8DC;--muted:#C0C0C0;--accent:#FFD700;--blue:#4DD0E1;--gold:#FFBF00;--code-bg:#1A1A2E;
+            --surface:#1A1A2E;--topbar-bg:rgba(20,20,37,.98);--main-bg:rgba(13,13,26,0.5);
+            --focus-ring:rgba(255,215,0,.35);--focus-glow:rgba(255,215,0,.08);
+            --input-bg:rgba(255,255,255,.04);--hover-bg:rgba(255,255,255,.06);
+            --strong:#fff;--em:#C0C0C0;--code-text:#f0c27f;--code-inline-bg:rgba(0,0,0,.35);--pre-text:#e2e8f0;
+            --accent-hover:#FFBF00;--accent-bg:rgba(255,215,0,0.08);--accent-bg-strong:rgba(255,215,0,0.15);--accent-text:#FFD700;
+            --error:#EF5350;--success:#4CAF50;--warning:#FFA726;--info:#4DD0E1;
+        }
+        
+        /* ── Smooth dark mode transitions ── */
+        body,header,footer,aside,nav,main,div,button,input,textarea,select{transition-property:background-color,border-color,color;transition-duration:.15s;transition-timing-function:ease;}
+        
+        body{background:var(--bg);color:var(--text);height:100vh;height:100dvh;overflow:hidden;display:flex;flex-direction:column;}
+        
+        /* ── Streamlit overrides ── */
         html, body {
             overflow: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
             overflow: hidden !important;
+            background: var(--bg);
         }
         [data-testid="stMain"] {
             overflow: hidden !important;
@@ -692,147 +735,292 @@ def _apply_page_style() -> None:
             max-width: 1380px;
             height: calc(100vh - 1rem);
             overflow: hidden;
+            background: var(--main-bg);
         }
         .block-container h3 {
             margin-top: 0.1rem;
             margin-bottom: 0.25rem;
+            color: var(--text);
         }
         [data-testid="stCaptionContainer"] {
             margin-top: 0;
             margin-bottom: 0.35rem;
+            color: var(--muted);
         }
+        
+        /* ── Sidebar styles ── */
+        [data-testid="stSidebar"] {
+            background: var(--sidebar) !important;
+            border-right: 1px solid var(--border) !important;
+        }
+        [data-testid="stSidebar"] h2 {
+            color: var(--text) !important;
+        }
+        [data-testid="stSidebar"] button {
+            background: var(--accent-bg) !important;
+            border: 1px solid var(--accent-bg-strong) !important;
+            color: var(--accent-text) !important;
+            border-radius: 9px !important;
+            padding: 9px 12px !important;
+            font-size: 13px !important;
+            font-weight: 500 !important;
+            transition: all .15s !important;
+        }
+        [data-testid="stSidebar"] button:hover {
+            background: var(--accent-bg-strong) !important;
+            border-color: var(--accent) !important;
+        }
+        [data-testid="stSidebar"] button[data-testid="baseButton-secondary"] {
+            background: var(--hover-bg) !important;
+            border: 1px solid var(--border) !important;
+            color: var(--text) !important;
+        }
+        [data-testid="stSidebar"] button[data-testid="baseButton-secondary"]:hover {
+            background: var(--accent-bg) !important;
+            border-color: var(--accent-bg-strong) !important;
+            color: var(--accent-text) !important;
+        }
+        
+        /* ── Chat styles ── */
         .chat-row {
             display: flex;
             width: 100%;
-            margin-bottom: 0.85rem;
+            margin-bottom: 1rem;
+            gap: 10px;
         }
         .chat-row-user {
             justify-content: flex-end;
         }
+        .chat-row-user .chat-content {
+            align-items: flex-end;
+        }
+        .chat-row-user .chat-bubble {
+            background: var(--accent);
+            color: #fff;
+            border-bottom-right-radius: 4px;
+            max-width: 75%;
+        }
         .chat-row-assistant {
             justify-content: flex-start;
         }
+        .chat-row-assistant .chat-content {
+            align-items: flex-start;
+        }
+        .chat-row-assistant .chat-bubble {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-bottom-left-radius: 4px;
+            max-width: 100%;
+        }
+        .chat-content {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            flex: 1;
+        }
         .chat-bubble {
             border-radius: 16px;
-            padding: 0.75rem 0.95rem;
+            padding: 0.85rem 1rem;
             word-break: break-word;
-            line-height: 1.5;
-        }
-        .chat-bubble-user {
-            max-width: 75%;
-            background: #1f6feb;
-            color: #fff;
-            border-bottom-right-radius: 4px;
-        }
-        .chat-bubble-assistant {
-            width: 100%;
-            background: #f6f8fb;
-            border: 1px solid #e6ebf2;
-            border-bottom-left-radius: 4px;
+            line-height: 1.6;
         }
         .chat-empty-state {
             text-align: center;
-            margin-top: 3.5rem;
-            color: #6b7280;
+            margin-top: 4rem;
+            color: var(--muted);
+            padding: 2rem;
         }
         .chat-stream-cursor {
-            color: #f8fafc;
+            color: var(--accent);
             font-size: 1.2rem;
             line-height: 1;
             padding: 0.1rem 0.3rem;
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
         }
         .chat-meta {
-            font-size: 0.85rem;
-            color: #6b7280;
-            margin-bottom: 0.35rem;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--muted);
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
         }
-        .chat-meta {
-        font-size: 12px;
-        font-weight: 500;
-        color: #6b7280;
-        margin-bottom: 6px;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-    }
-    .role-icon {
-        width: 22px;
-        height: 22px;
-        border-radius: 50%;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 10px;
-        font-weight: 700;
-    }
-    .role-icon.assistant {
-        background: rgba(255,215,0,0.22);
-        color: #FFD700;
-        border: 1px solid rgba(255,215,0,0.22);
-    }
-    .msg-files {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-        margin-bottom: 6px;
-    }
-    .msg-file-badge {
-        display: flex;
-        align-items: center;
-        gap: 5px;
-        background: rgba(255,215,0,0.12);
-        border: 1px solid rgba(255,215,0,0.22);
-        border-radius: 6px;
-        padding: 3px 8px;
-        font-size: 12px;
-        color: #FFD700;
-    }
-    .st-key-pg_dock {
+        .role-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 700;
+            flex-shrink: 0;
+            margin-top: 4px;
+        }
+        .role-icon.assistant {
+            background: var(--accent-bg);
+            color: var(--accent-text);
+            border: 1px solid var(--accent-bg-strong);
+        }
+        .role-icon.user {
+            background: var(--accent);
+            color: #fff;
+            border: 1px solid var(--accent-hover);
+        }
+        
+        /* ── File attachments ── */
+        .msg-files {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+        .msg-file-badge {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            background: var(--accent-bg);
+            border: 1px solid var(--accent-bg-strong);
+            border-radius: 6px;
+            padding: 3px 8px;
+            font-size: 12px;
+            color: var(--accent-text);
+        }
+        
+        /* ── Composer dock ── */
+        .st-key-pg_dock {
             position: sticky;
             bottom: 4.0rem;
             z-index: 20;
             padding: 0.55rem 0 0.2rem 0;
             transform: translateY(-14px);
             backdrop-filter: blur(6px);
-            background: rgba(10, 14, 30, 0.72);
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            background: var(--sidebar);
+            border-top: 1px solid var(--border);
         }
         .st-key-pg_dock [data-baseweb="select"] {
             margin-bottom: 0;
         }
+        
+        /* ── Status pill ── */
         .status-pill {
             width: 100%;
             height: 2.5rem;
             border-radius: 8px;
             display: flex;
             align-items: center;
+            justify-content: center;
+            gap: 8px;
             padding: 0 0.9rem;
             font-weight: 600;
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--border2);
             box-sizing: border-box;
             margin-top: 0.15rem;
+            transition: all .2s ease;
         }
         .status-pill.idle {
-            color: #86efac;
-            background: rgba(21, 128, 61, 0.28);
+            color: var(--success);
+            background: rgba(76, 175, 80, 0.15);
+            border-color: rgba(76, 175, 80, 0.3);
         }
         .status-pill.streaming {
-            color: #93c5fd;
-            background: rgba(29, 78, 216, 0.28);
+            color: var(--accent-text);
+            background: var(--accent-bg);
+            border-color: var(--accent-bg-strong);
+            animation: pulse-glow 2s ease-in-out infinite;
         }
+        @keyframes pulse-glow {
+            0%, 100% { 
+                box-shadow: 0 0 0 0 rgba(255, 215, 0, 0.2);
+            }
+            50% { 
+                box-shadow: 0 0 0 4px rgba(255, 215, 0, 0.08);
+            }
+        }
+        
+        /* ── Loading dots animation ── */
+        .loading-dots {
+            display: flex;
+            gap: 3px;
+        }
+        .loading-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--accent);
+            animation: dot-bounce 1.4s ease-in-out infinite both;
+        }
+        .loading-dot:nth-child(1) { animation-delay: -0.32s; }
+        .loading-dot:nth-child(2) { animation-delay: -0.16s; }
+        .loading-dot:nth-child(3) { animation-delay: 0s; }
+        @keyframes dot-bounce {
+            0%, 80%, 100% {
+                transform: scale(0.6);
+                opacity: 0.5;
+            }
+            40% {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+        
+        /* ── Typing indicator ── */
+        .typing-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0.5rem 0.75rem;
+            background: var(--surface);
+            border-radius: 16px;
+            border-bottom-left-radius: 4px;
+        }
+        .typing-bubble {
+            display: flex;
+            gap: 3px;
+        }
+        .typing-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--accent);
+            animation: typing-bounce 1.4s ease-in-out infinite both;
+        }
+        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+        .typing-dot:nth-child(3) { animation-delay: 0s; }
+        @keyframes typing-bounce {
+            0%, 80%, 100% {
+                transform: translateY(0);
+                opacity: 0.4;
+            }
+            40% {
+                transform: translateY(-4px);
+                opacity: 1;
+            }
+        }
+        
+        /* ── Attachments list ── */
         .attachments-list {
             margin-top: 0.5rem;
             padding-top: 0.5rem;
-            border-top: 1px solid rgba(255, 255, 255, 0.2);
+            border-top: 1px solid var(--border);
         }
         .attachment-item {
             display: flex;
             align-items: center;
             padding: 0.4rem 0.6rem;
             margin-bottom: 0.3rem;
-            background: rgba(255, 255, 255, 0.1);
+            background: var(--hover-bg);
             border-radius: 6px;
             font-size: 0.9rem;
+            color: var(--text);
         }
         .attachment-name {
             margin-left: 0.5rem;
@@ -845,14 +1033,19 @@ def _apply_page_style() -> None:
             margin-left: 0.5rem;
             opacity: 0.8;
             font-size: 0.8rem;
+            color: var(--muted);
         }
+        
+        /* ── Message text ── */
         .message-text {
             margin-bottom: 0.3rem;
         }
+        
+        /* ── Attachment preview ── */
         .attachment-preview-container {
             margin-top: 0.5rem;
             padding: 0.5rem;
-            background: rgba(0, 0, 0, 0.1);
+            background: var(--hover-bg);
             border-radius: 8px;
         }
         .attachment-badge {
@@ -861,10 +1054,11 @@ def _apply_page_style() -> None:
             padding: 0.2rem 0.5rem;
             margin-right: 0.3rem;
             margin-bottom: 0.3rem;
-            background: rgba(59, 130, 246, 0.2);
-            border: 1px solid rgba(59, 130, 246, 0.3);
+            background: var(--accent-bg);
+            border: 1px solid var(--accent-bg-strong);
             border-radius: 4px;
             font-size: 0.8rem;
+            color: var(--accent-text);
         }
         .attachment-badge .remove-btn {
             margin-left: 0.4rem;
@@ -874,22 +1068,113 @@ def _apply_page_style() -> None:
         .attachment-badge .remove-btn:hover {
             opacity: 1;
         }
+        
         /* ── Compact file uploader in dock ── */
-    .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"],
-    .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileInfo"] {
-        display: none !important;
-    }
-    .st-key-pg_dock [data-testid="stFileUploaderDropzone"] {
-        min-height: 1.8rem;
-        padding: 2px 6px;
-    }
-    .st-key-pg_dock [data-testid="stFileUploaderDropzone"] > section {
-        padding: 2px 4px;
-    }
-    .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] {
-        font-size: 0.75rem;
-    }
-    </style>
+        .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"],
+        .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileInfo"] {
+            display: none !important;
+        }
+        .st-key-pg_dock [data-testid="stFileUploaderDropzone"] {
+            min-height: 2.2rem;
+            padding: 4px 10px;
+            border: 1px dashed var(--border) !important;
+            background: var(--input-bg) !important;
+            border-radius: 8px !important;
+            transition: all .15s ease;
+        }
+        .st-key-pg_dock [data-testid="stFileUploaderDropzone"]:hover {
+            border-color: var(--accent) !important;
+            background: var(--accent-bg) !important;
+        }
+        .st-key-pg_dock [data-testid="stFileUploaderDropzone"] > section {
+            padding: 4px 8px;
+            gap: 6px !important;
+        }
+        .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] {
+            font-size: 0.8rem;
+            color: var(--text) !important;
+        }
+        .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] svg {
+            width: 14px !important;
+            height: 14px !important;
+            color: var(--muted) !important;
+        }
+        
+        /* ── Upload button icon ── */
+        .upload-icon-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border-radius: 8px;
+            background: var(--hover-bg);
+            border: 1px solid var(--border);
+            color: var(--muted);
+            cursor: pointer;
+            transition: all .15s ease;
+        }
+        .upload-icon-btn:hover {
+            background: var(--accent-bg);
+            border-color: var(--accent-bg-strong);
+            color: var(--accent-text);
+        }
+        
+        /* ── Input fields ── */
+        [data-testid="stTextInput"] input {
+            background: var(--input-bg) !important;
+            border: 1px solid var(--border2) !important;
+            border-radius: 8px !important;
+            color: var(--text) !important;
+            padding: 10px 12px !important;
+        }
+        [data-testid="stTextInput"] input:focus {
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 3px var(--accent-bg) !important;
+        }
+        [data-testid="stTextInput"] input::placeholder {
+            color: var(--muted) !important;
+        }
+        
+        /* ── Select boxes ── */
+        [data-baseweb="select"] {
+            background: var(--input-bg) !important;
+            border: 1px solid var(--border2) !important;
+            border-radius: 8px !important;
+        }
+        [data-baseweb="select"]:hover {
+            border-color: var(--accent) !important;
+        }
+        [data-baseweb="select"] [data-baseweb="select-value"] {
+            color: var(--text) !important;
+        }
+        
+        /* ── Buttons ── */
+        [data-testid="baseButton-primary"] {
+            background: var(--accent) !important;
+            border: 1px solid var(--accent) !important;
+            color: #fff !important;
+            border-radius: 8px !important;
+            padding: 10px 16px !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="baseButton-primary"]:hover {
+            background: var(--accent-hover) !important;
+            border-color: var(--accent-hover) !important;
+        }
+        [data-testid="baseButton-secondary"] {
+            background: var(--hover-bg) !important;
+            border: 1px solid var(--border2) !important;
+            color: var(--text) !important;
+            border-radius: 8px !important;
+            padding: 10px 16px !important;
+        }
+        [data-testid="baseButton-secondary"]:hover {
+            background: var(--accent-bg) !important;
+            border-color: var(--accent-bg-strong) !important;
+            color: var(--accent-text) !important;
+        }
+        </style>
         """,
         unsafe_allow_html=True,
     )
@@ -926,8 +1211,8 @@ def _render_session_panel(
         _render_messages(message_snapshot, current_streaming)
 
     with st.container(key="pg_dock"):
-        # ── Row 1: provider | model | upload | stop/idle ──
-        cfg1, cfg2, cfg3, cfg4 = st.columns([1.2, 1.6, 0.8, 1.0])
+        # ── Row 1: provider | model | upload | status ──
+        cfg1, cfg2, cfg3, cfg4 = st.columns([1.2, 1.8, 0.7, 1.0])
         with cfg1:
             provider_choice = st.selectbox(
                 "供应商",
