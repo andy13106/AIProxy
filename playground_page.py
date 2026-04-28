@@ -137,6 +137,7 @@ def _ensure_state(provider_names: list[str]) -> None:
             "models_cache": {},
             "loaded_from_db": False,
             "pending_attachments": [],
+            "file_uploader_counters": {},
         }
 
     state = st.session_state.playground_state
@@ -197,7 +198,7 @@ def _upsert_session_to_db(session_data: dict[str, Any]) -> None:
         session.commit()
 
 
-def _upsert_message_to_db(session_uid: str, seq: int, role: str, content: str) -> None:
+def _upsert_message_to_db(session_uid: str, seq: int, role: str, content: str) -> int:
     with SessionLocal() as session:
         db_obj = (
             session.query(PlaygroundChatMessage)
@@ -215,10 +216,12 @@ def _upsert_message_to_db(session_uid: str, seq: int, role: str, content: str) -
                 content=content or "",
             )
             session.add(db_obj)
+            session.flush()
         else:
             db_obj.role = role
             db_obj.content = content or ""
         session.commit()
+        return db_obj.id
 
 
 def _delete_session_from_db(session_uid: str) -> None:
@@ -526,63 +529,48 @@ def _format_file_size(size_bytes: int) -> str:
 
 def _render_user_message(content: str, attachments: list[dict[str, Any]] | None = None) -> None:
     safe_text = html.escape(content or "")
-    attachment_parts = []
+    file_badges = []
 
     if attachments:
         for att in attachments:
             att_data = _get_attachment_data(att.get("id"))
             if not att_data:
                 continue
-
-            filename = att_data.get("filename", "未知文件")
-            file_size = att_data.get("file_size", 0)
+            filename = att_data.get("filename", "?")
+            size_str = _format_file_size(att_data.get("file_size", 0))
             att_type = att_data.get("attachment_type", "unknown")
             file_path = att_data.get("file_path")
-
-            size_str = _format_file_size(file_size)
-            icon = "📄"
-            if att_type == "image":
-                icon = "🖼️"
-            elif filename.lower().endswith(".pdf"):
-                icon = "📕"
-            elif filename.lower().endswith((".doc", ".docx")):
-                icon = "📘"
-            elif filename.lower().endswith((".xls", ".xlsx")):
-                icon = "📗"
-            elif filename.lower().endswith((".ppt", ".pptx")):
-                icon = "📙"
+            icon = "\U0001f5bc\ufe0f" if att_type == "image" else "\U0001f4ce"
 
             if att_type == "image" and file_path and os.path.exists(file_path):
                 try:
                     st.image(file_path, caption=filename, width=200)
+                    continue
                 except Exception:
-                    attachment_parts.append(
-                        f'<div class="attachment-item">{icon} <span class="attachment-name">{html.escape(filename)}</span> <span class="attachment-size">({size_str})</span></div>'
-                    )
-            else:
-                attachment_parts.append(
-                    f'<div class="attachment-item">{icon} <span class="attachment-name">{html.escape(filename)}</span> <span class="attachment-size">({size_str})</span></div>'
-                )
+                    pass
 
-    if safe_text or attachment_parts:
-        content_html = f'<div class="chat-bubble chat-bubble-user">'
-        if safe_text:
-            content_html += f'<div class="message-text">{safe_text}</div>'
-        if attachment_parts:
-            content_html += f'<div class="attachments-list">{"".join(attachment_parts)}</div>'
-        content_html += "</div>"
+            file_badges.append(
+                f'<div class="msg-file-badge">{icon} {html.escape(filename)[:20]} ({size_str})</div>'
+            )
 
+    parts = []
+    if file_badges:
+        parts.append(f'<div class="msg-files">{"".join(file_badges)}</div>')
+    if safe_text:
+        parts.append(f'<div class="chat-bubble chat-bubble-user"><div class="message-text">{safe_text}</div></div>')
+
+    if parts:
         st.markdown(
-            f"""
-            <div class="chat-row chat-row-user">
-                {content_html}
-            </div>
-            """,
+            f'<div class="chat-row chat-row-user">{"".join(parts)}</div>',
             unsafe_allow_html=True,
         )
 
 
 def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
+    st.markdown(
+        '<div class="chat-meta"><div class="role-icon assistant">AI</div> <span>Assistant</span></div>',
+        unsafe_allow_html=True,
+    )
     text = content or ""
     thinking_parts = THINKING_PATTERN.findall(text)
     content_without_thinking = THINKING_PATTERN.sub("", text).strip()
@@ -592,9 +580,10 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
             st.markdown(think)
 
     if not content_without_thinking and is_streaming:
-        st.markdown("▌")
+        st.markdown('<span class="chat-stream-cursor">▌</span>', unsafe_allow_html=True)
         return
 
+    st.markdown('<div class="chat-bubble chat-bubble-assistant">', unsafe_allow_html=True)
     cursor = 0
     for match in CODE_BLOCK_PATTERN.finditer(content_without_thinking):
         start, end = match.span()
@@ -611,8 +600,8 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
     if cursor < len(content_without_thinking):
         tail = content_without_thinking[cursor:]
         if tail.strip() or is_streaming:
-            st.markdown(tail + ("\n\n▌" if is_streaming else ""))
-
+            st.markdown(tail + (" ▌" if is_streaming else ""))
+    st.markdown('</div>', unsafe_allow_html=True)
 
 def _render_error_message(content: str) -> None:
     st.error(content or "未知错误")
@@ -726,7 +715,48 @@ def _apply_page_style() -> None:
             color: #6b7280;
             margin-bottom: 0.35rem;
         }
-        .st-key-pg_dock {
+        .chat-meta {
+        font-size: 12px;
+        font-weight: 500;
+        color: #6b7280;
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .role-icon {
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        font-weight: 700;
+    }
+    .role-icon.assistant {
+        background: rgba(255,215,0,0.22);
+        color: #FFD700;
+        border: 1px solid rgba(255,215,0,0.22);
+    }
+    .msg-files {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 6px;
+    }
+    .msg-file-badge {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        background: rgba(255,215,0,0.12);
+        border: 1px solid rgba(255,215,0,0.22);
+        border-radius: 6px;
+        padding: 3px 8px;
+        font-size: 12px;
+        color: #FFD700;
+    }
+    .st-key-pg_dock {
             position: sticky;
             bottom: 4.0rem;
             z-index: 20;
@@ -813,7 +843,22 @@ def _apply_page_style() -> None:
         .attachment-badge .remove-btn:hover {
             opacity: 1;
         }
-        </style>
+        /* ── Compact file uploader in dock ── */
+    .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"],
+    .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileInfo"] {
+        display: none !important;
+    }
+    .st-key-pg_dock [data-testid="stFileUploaderDropzone"] {
+        min-height: 1.8rem;
+        padding: 2px 6px;
+    }
+    .st-key-pg_dock [data-testid="stFileUploaderDropzone"] > section {
+        padding: 2px 4px;
+    }
+    .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] {
+        font-size: 0.75rem;
+    }
+    </style>
         """,
         unsafe_allow_html=True,
     )
@@ -850,8 +895,9 @@ def _render_session_panel(
         _render_messages(message_snapshot, current_streaming)
 
     with st.container(key="pg_dock"):
-        config_col1, config_col2, config_col3 = st.columns([1.2, 1.6, 1.2])
-        with config_col1:
+        # ── Row 1: provider | model | upload | stop/idle ──
+        cfg1, cfg2, cfg3, cfg4 = st.columns([1.2, 1.6, 0.8, 1.0])
+        with cfg1:
             provider_choice = st.selectbox(
                 "供应商",
                 options=provider_names,
@@ -866,10 +912,10 @@ def _render_session_panel(
                 _upsert_session_to_db(current_session)
                 st.rerun()
 
-        selected_provider, selected_key = provider_to_key[current_session["provider"]]
-        text_models = _get_text_models(selected_provider, selected_key)
+            selected_provider, selected_key = provider_to_key[current_session["provider"]]
+            text_models = _get_text_models(selected_provider, selected_key)
 
-        with config_col2:
+        with cfg2:
             if not text_models:
                 st.warning("当前供应商未获取到文本模型。")
                 selected_model = None
@@ -886,7 +932,18 @@ def _render_session_panel(
                     current_session["model"] = selected_model
                     _upsert_session_to_db(current_session)
 
-        with config_col3:
+        with cfg3:
+            uploader_key = f"file_uploader_{current_session_id}"
+            uploader_counter = state.get("file_uploader_counters", {}).get(uploader_key, 0)
+            uploaded_files = st.file_uploader(
+                "📎",
+                type=["jpg", "jpeg", "png", "gif", "webp", "bmp", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "md"],
+                key=f"{uploader_key}_{uploader_counter}",
+                accept_multiple_files=True,
+                label_visibility="collapsed",
+            )
+
+        with cfg4:
             if current_streaming:
                 if st.button("⏹ 停止", key=f"stop_btn_{current_session_id}", use_container_width=True, type="primary"):
                     _stop_stream_worker(current_session_id)
@@ -894,91 +951,61 @@ def _render_session_panel(
             else:
                 st.markdown('<div class="status-pill idle">空闲</div>', unsafe_allow_html=True)
 
-        # 获取当前待发送的附件
-        def get_pending_attachments():
-            return state.get("pending_attachments", [])
-
-        # 文件上传区域
-        upload_col1, upload_col2 = st.columns([10, 2])
-        with upload_col1:
-            uploaded_files = st.file_uploader(
-                "添加附件（支持拖拽上传）",
-                type=["jpg", "jpeg", "png", "gif", "webp", "bmp", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "md"],
-                key=f"file_uploader_{current_session_id}",
-                accept_multiple_files=True,
-                label_visibility="visible",
-            )
-
-            # 处理上传的文件
-            if uploaded_files:
-                # 使用文件的唯一标识来避免重复处理
-                for uploaded_file in uploaded_files:
-                    filename = uploaded_file.name
-                    # 使用 uploaded_file.size 来获取文件大小（如果可用）
-                    try:
-                        file_size = uploaded_file.size
-                    except AttributeError:
-                        # 如果 size 属性不可用，读取文件来获取大小
-                        file_bytes = uploaded_file.read()
-                        file_size = len(file_bytes)
-                        # 重置文件指针
-                        uploaded_file.seek(0)
-
-                    # 创建文件的唯一标识（文件名 + 大小）
-                    file_identifier = f"{filename}_{file_size}"
-
-                    # 检查是否已存在于待发送列表中（避免重复添加）
-                    already_exists = False
-                    for existing in get_pending_attachments():
-                        existing_data = _get_attachment_data(existing.get("id"))
-                        if existing_data and existing_data.get("filename") == filename and existing_data.get("file_size") == file_size:
-                            already_exists = True
-                            break
-
-                    if not already_exists:
-                        # 读取文件内容
-                        try:
-                            # 如果之前已经读取过，需要重置文件指针
-                            uploaded_file.seek(0)
-                        except Exception:
-                            pass
-                        file_bytes = uploaded_file.read()
-                        mime_type = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-                        # 保存附件
-                        att_id = _save_attachment(file_bytes, filename, mime_type)
-                        if "pending_attachments" not in state:
-                            state["pending_attachments"] = []
-                        state["pending_attachments"].append({"id": att_id})
-
-        # 附件预览区域
-        current_pending = get_pending_attachments()
-        if current_pending:
-            preview_col1, preview_col2 = st.columns([10, 2])
-            with preview_col1:
-                st.caption("已添加的附件：")
-                badge_html_parts = []
-                for idx, att in enumerate(current_pending):
-                    att_data = _get_attachment_data(att.get("id"))
-                    if att_data:
-                        filename = att_data.get("filename", "未知文件")
-                        file_size = att_data.get("file_size", 0)
-                        size_str = _format_file_size(file_size)
-                        icon = "🖼️" if att_data.get("attachment_type") == "image" else "📄"
-                        badge_html_parts.append(
-                            f'<span class="attachment-badge">{icon} {html.escape(filename)[:25]} ({size_str})</span>'
-                        )
-                if badge_html_parts:
+        # ── Row 2: attachment chips (only when there are pending attachments) ──
+        pending_attachments = state.get("pending_attachments", [])
+        if pending_attachments:
+            chip_parts = []
+            for att in pending_attachments:
+                att_data = _get_attachment_data(att.get("id"))
+                if att_data:
+                    fname = att_data.get("filename", "?")
+                    sz = _format_file_size(att_data.get("file_size", 0))
+                    icon = "\U0001f5bc\ufe0f" if att_data.get("attachment_type") == "image" else "\U0001f4ce"
+                    chip_parts.append(
+                        f'<span class="msg-file-badge">{icon} {html.escape(fname)[:20]} ({sz})</span>'
+                    )
+            if chip_parts:
+                att_row_l, att_row_r = st.columns([10, 2])
+                with att_row_l:
                     st.markdown(
-                        f'<div class="attachment-preview-container">{"".join(badge_html_parts)}</div>',
+                        f'<div class="msg-files">{"".join(chip_parts)}</div>',
                         unsafe_allow_html=True,
                     )
-            with preview_col2:
-                st.write("")
-                if st.button("清空附件", key=f"clear_attachments_{current_session_id}", use_container_width=True):
-                    state["pending_attachments"] = []
-                    st.rerun()
+                with att_row_r:
+                    if st.button("清空", key=f"clear_attachments_{current_session_id}", use_container_width=True):
+                        state["pending_attachments"] = []
+                        st.rerun()
 
+        # ── Process uploaded files ──
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                filename = uploaded_file.name
+                try:
+                    file_size = uploaded_file.size
+                except AttributeError:
+                    file_bytes = uploaded_file.read()
+                    file_size = len(file_bytes)
+                    uploaded_file.seek(0)
+
+                already_exists = any(
+                    _get_attachment_data(e.get("id")) is not None
+                    and _get_attachment_data(e.get("id")).get("filename") == filename
+                    and _get_attachment_data(e.get("id")).get("file_size") == file_size
+                    for e in state.get("pending_attachments", [])
+                )
+                if not already_exists:
+                    try:
+                        uploaded_file.seek(0)
+                    except Exception:
+                        pass
+                    file_bytes = uploaded_file.read()
+                    mime_type = uploaded_file.type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                    att_id = _save_attachment(file_bytes, filename, mime_type)
+                    if "pending_attachments" not in state:
+                        state["pending_attachments"] = []
+                    state["pending_attachments"].append({"id": att_id})
+
+        # ── Row 3: input + send (inside form) ──
         with st.form(key=f"chat_form_{current_session_id}", clear_on_submit=True, border=False):
             input_col, send_col = st.columns([12, 1.6])
             with input_col:
@@ -986,16 +1013,17 @@ def _render_session_panel(
                     "输入消息",
                     key=f"chat_input_{current_session_id}",
                     label_visibility="collapsed",
-                    placeholder="输入消息（可添加附件后一起发送）",
+                    placeholder="输入消息…",
                     disabled=current_streaming or not bool(current_session.get("model")),
                 )
             with send_col:
                 submitted = st.form_submit_button(
-                    "发送",
+                    "▶ 发送",
                     use_container_width=True,
                     disabled=current_streaming or not bool(current_session.get("model")),
                 )
 
+        # ── Handle form submission ──
         if submitted:
             pending_attachments = state.get("pending_attachments", [])
             has_content = bool(prompt and prompt.strip()) or bool(pending_attachments)
@@ -1013,16 +1041,6 @@ def _render_session_panel(
                     "role": "user",
                     "content": text,
                 }
-                if pending_attachments:
-                    user_message["attachments"] = [dict(a) for a in pending_attachments]
-                    for att in pending_attachments:
-                        with SessionLocal() as session:
-                            db_attachment = session.query(PlaygroundChatAttachment).filter(
-                                PlaygroundChatAttachment.attachment_uid == att.get("id")
-                            ).first()
-                            if db_attachment:
-                                db_attachment.session_uid = current_session_id
-                                session.commit()
 
                 current_session["messages"].append(user_message)
                 current_session["messages"].append({"role": "assistant", "content": ""})
@@ -1032,12 +1050,25 @@ def _render_session_panel(
                 user_idx = len(current_session["messages"]) - 2
                 assistant_idx = len(current_session["messages"]) - 1
                 _upsert_session_to_db(current_session)
-                _upsert_message_to_db(
+                user_message_id = _upsert_message_to_db(
                     session_uid=current_session_id,
                     seq=user_idx,
                     role="user",
                     content=text,
                 )
+
+                if pending_attachments:
+                    user_message["attachments"] = [dict(a) for a in pending_attachments]
+                    for att in pending_attachments:
+                        with SessionLocal() as session:
+                            db_attachment = session.query(PlaygroundChatAttachment).filter(
+                                PlaygroundChatAttachment.attachment_uid == att.get("id")
+                            ).first()
+                            if db_attachment:
+                                db_attachment.session_uid = current_session_id
+                                db_attachment.message_id = user_message_id
+                                session.commit()
+
                 _upsert_message_to_db(
                     session_uid=current_session_id,
                     seq=assistant_idx,
@@ -1046,6 +1077,11 @@ def _render_session_panel(
                 )
 
                 state["pending_attachments"] = []
+                # Reset file uploader counter so Streamlit creates a fresh uploader
+                if "file_uploader_counters" not in state:
+                    state["file_uploader_counters"] = {}
+                uploader_key = f"file_uploader_{current_session_id}"
+                state["file_uploader_counters"][uploader_key] = state.get("file_uploader_counters", {}).get(uploader_key, 0) + 1
 
                 payload_messages = _build_api_messages(current_session["messages"][:-1])
                 _start_stream_worker(
@@ -1057,7 +1093,6 @@ def _render_session_panel(
                     payload_messages=payload_messages,
                 )
                 st.rerun()
-
 
 def render_playground_page() -> None:
     _apply_page_style()
