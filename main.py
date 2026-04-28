@@ -6,6 +6,12 @@ import time
 
 from dotenv import load_dotenv
 
+# 导入线程清理函数
+try:
+    from playground_page import cleanup_threads
+except ImportError:
+    cleanup_threads = None
+
 load_dotenv()
 
 
@@ -118,6 +124,14 @@ def start_services() -> None:
             time.sleep(5)
     except KeyboardInterrupt:
         print("\nStopping services...")
+        
+        # 清理工作线程
+        if cleanup_threads:
+            try:
+                cleanup_threads()
+            except Exception:
+                pass
+        
         backend_process.terminate()
         try:
             backend_process.wait(timeout=10)

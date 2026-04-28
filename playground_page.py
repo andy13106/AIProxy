@@ -30,6 +30,26 @@ _WORKER_THREADS: dict[str, threading.Thread] = {}
 _WORKER_STOP_FLAGS: dict[str, bool] = {}
 
 
+def cleanup_threads() -> None:
+    """清理所有工作线程"""
+    with _WORKER_LOCK:
+        # 为所有线程设置停止标志
+        for session_id in list(_WORKER_THREADS.keys()):
+            _WORKER_STOP_FLAGS[session_id] = True
+        
+        # 等待线程结束（最多等待2秒）
+        for session_id, thread in list(_WORKER_THREADS.items()):
+            if thread.is_alive():
+                try:
+                    thread.join(timeout=2.0)
+                except Exception:
+                    pass
+        
+        # 清空线程和停止标志
+        _WORKER_THREADS.clear()
+        _WORKER_STOP_FLAGS.clear()
+
+
 _DATA_DIR = Path(__file__).parent / "data" / "attachments"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -360,6 +380,7 @@ def _start_stream_worker(
     def run_stream() -> None:
         usage_data: dict[str, Any] = {}
         stopped = False
+        resp = None
         try:
             _clear_stop_flag(session_id)
             url = f"{provider.api_base.rstrip('/')}/chat/completions"
@@ -374,6 +395,10 @@ def _start_stream_worker(
                 "temperature": 0.7,
                 "stream": True,
             }
+
+            if _should_stop(session_id):
+                stopped = True
+                return
 
             resp = requests.post(url, headers=headers, json=payload, timeout=180, stream=True)
             if resp.status_code != 200:
@@ -505,6 +530,12 @@ def _start_stream_worker(
                     )
                 _upsert_session_to_db(session)
         finally:
+            # 确保关闭响应连接
+            if resp:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             with _WORKER_LOCK:
                 _WORKER_THREADS.pop(session_id, None)
                 _WORKER_STOP_FLAGS.pop(session_id, None)
