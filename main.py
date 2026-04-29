@@ -3,22 +3,53 @@ import socket
 import subprocess
 import sys
 import time
+import atexit
+import signal
+import threading
 
 from dotenv import load_dotenv
 
-# 导入线程清理函数
 try:
     from playground_page import cleanup_threads
 except ImportError:
     cleanup_threads = None
 
+_shutting_down = False
+_shutdown_lock = threading.Lock()
+
+def _set_shutting_down():
+    with _shutdown_lock:
+        global _shutting_down
+        _shutting_down = True
+
+def _is_shutting_down():
+    with _shutdown_lock:
+        return _shutting_down
+
+def _cleanup_thread_pools():
+    try:
+        import concurrent.futures
+        import concurrent.futures.thread
+        pool = getattr(concurrent.futures.ThreadPoolExecutor, '_default_executor', None)
+        if pool is not None:
+            pool.shutdown(wait=False)
+            concurrent.futures.ThreadPoolExecutor._default_executor = None
+        
+        if hasattr(concurrent.futures.thread, '_threads_queues'):
+            concurrent.futures.thread._threads_queues.clear()
+        
+        if hasattr(concurrent.futures.thread, '_python_exit'):
+            concurrent.futures.thread._python_exit = lambda: None
+    except Exception:
+        pass
+
+atexit.register(_cleanup_thread_pools)
+
 load_dotenv()
 
 
 def configure_console() -> None:
-    """Best-effort UTF-8 console output for Windows/macOS/Linux."""
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         if stream is not None and hasattr(stream, "reconfigure"):
@@ -98,12 +129,62 @@ def start_services() -> None:
     ]
     if selected_admin_port is not None:
         print("Admin panel: " f"http://{admin_host}:{selected_admin_port}")
-        frontend_process = subprocess.Popen(frontend_cmd)
+        
+        def set_new_process_group():
+            os.setpgrp()
+        
+        frontend_process = subprocess.Popen(frontend_cmd, preexec_fn=set_new_process_group)
 
     print("\nServices started. Press Ctrl+C to stop.")
 
+    def stop_services():
+        print("\nStopping services...")
+        
+        if cleanup_threads:
+            try:
+                cleanup_threads()
+            except Exception:
+                pass
+        
+        if frontend_process is not None and frontend_process.poll() is None:
+            try:
+                os.killpg(os.getpgid(frontend_process.pid), signal.SIGTERM)
+                try:
+                    frontend_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(frontend_process.pid), signal.SIGKILL)
+                    frontend_process.wait()
+            except Exception:
+                try:
+                    frontend_process.terminate()
+                    frontend_process.wait(timeout=5)
+                except Exception:
+                    pass
+        
+        if backend_process.poll() is None:
+            backend_process.terminate()
+            try:
+                backend_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                backend_process.kill()
+                backend_process.wait()
+        
+        print("Services stopped.")
+        sys.exit(0)
+
+    def handle_signal(signum, frame):
+        if _is_shutting_down():
+            return
+        _set_shutting_down()
+        stop_services()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
     try:
         while True:
+            if _is_shutting_down():
+                break
             if backend_process.poll() is not None:
                 print("Backend exited unexpectedly. Restarting...")
                 backend_process = subprocess.Popen(backend_cmd)
@@ -121,31 +202,11 @@ def start_services() -> None:
                     print(f"Admin panel exited unexpectedly. Restarting in {delay}s...")
                     time.sleep(delay)
                     frontend_process = subprocess.Popen(frontend_cmd)
-            time.sleep(5)
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping services...")
-        
-        # 清理工作线程
-        if cleanup_threads:
-            try:
-                cleanup_threads()
-            except Exception:
-                pass
-        
-        backend_process.terminate()
-        try:
-            backend_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            backend_process.kill()
-            backend_process.wait()
-        if frontend_process is not None:
-            frontend_process.terminate()
-            try:
-                frontend_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                frontend_process.kill()
-                frontend_process.wait()
-        print("Services stopped.")
+        if not _is_shutting_down():
+            _set_shutting_down()
+            stop_services()
 
 
 if __name__ == "__main__":
