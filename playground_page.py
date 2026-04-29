@@ -611,10 +611,19 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
             st.markdown(think)
 
     if not content_without_thinking and is_streaming:
-        st.markdown('<span class="chat-stream-cursor">▌</span>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="chat-row chat-row-assistant">'
+            '<div class="chat-bubble chat-bubble-assistant"><span class="chat-stream-cursor">▌</span></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
         return
 
-    st.markdown('<div class="chat-bubble chat-bubble-assistant">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="chat-row chat-row-assistant">'
+        '<div class="chat-bubble chat-bubble-assistant">',
+        unsafe_allow_html=True,
+    )
     cursor = 0
     for match in CODE_BLOCK_PATTERN.finditer(content_without_thinking):
         start, end = match.span()
@@ -632,7 +641,7 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
         tail = content_without_thinking[cursor:]
         if tail.strip() or is_streaming:
             st.markdown(tail + (" ▌" if is_streaming else ""))
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div></div>', unsafe_allow_html=True)
 
 def _render_error_message(content: str) -> None:
     st.error(content or "未知错误")
@@ -660,13 +669,7 @@ def _render_messages(messages: list[dict[str, Any]], current_session_streaming: 
             _render_user_message(content, attachments)
         elif role == "assistant":
             is_streaming = current_session_streaming and idx == len(messages) - 1
-            if is_streaming and not str(content).strip():
-                st.markdown(
-                    '<div class="chat-row chat-row-assistant"><div class="chat-stream-cursor">▌</div></div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                _render_assistant_message(content, is_streaming=is_streaming)
+            _render_assistant_message(content, is_streaming=is_streaming)
         elif role == "system":
             st.info(content)
         elif role == "error":
@@ -879,15 +882,42 @@ def _apply_page_style() -> None:
     .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileInfo"] {
         display: none !important;
     }
+    .st-key-pg_dock [data-testid="stFileUploader"] {
+        min-height: 2.5rem;
+        max-height: 2.5rem;
+        display: flex;
+        align-items: center;
+        margin: 0;
+        padding: 0;
+    }
+    .st-key-pg_dock [data-testid="stFileUploader"] > div {
+        margin: 0;
+        padding: 0;
+    }
     .st-key-pg_dock [data-testid="stFileUploaderDropzone"] {
-        min-height: 1.8rem;
-        padding: 2px 6px;
+        min-height: 2.5rem;
+        max-height: 2.5rem;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzone"] > section {
-        padding: 2px 4px;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 2.5rem;
+        max-height: 2.5rem;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] {
         font-size: 0.75rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .st-key-pg_dock [data-testid="stFileUploaderDropzone"] [data-testid="stFileUploaderDropzoneInstructions"] {
+        display: none !important;
     }
     </style>
         """,
@@ -982,32 +1012,7 @@ def _render_session_panel(
             else:
                 st.markdown('<div class="status-pill idle">空闲</div>', unsafe_allow_html=True)
 
-        # ── Row 2: attachment chips (only when there are pending attachments) ──
-        pending_attachments = state.get("pending_attachments", [])
-        if pending_attachments:
-            chip_parts = []
-            for att in pending_attachments:
-                att_data = _get_attachment_data(att.get("id"))
-                if att_data:
-                    fname = att_data.get("filename", "?")
-                    sz = _format_file_size(att_data.get("file_size", 0))
-                    icon = "\U0001f5bc\ufe0f" if att_data.get("attachment_type") == "image" else "\U0001f4ce"
-                    chip_parts.append(
-                        f'<span class="msg-file-badge">{icon} {html.escape(fname)[:20]} ({sz})</span>'
-                    )
-            if chip_parts:
-                att_row_l, att_row_r = st.columns([10, 2])
-                with att_row_l:
-                    st.markdown(
-                        f'<div class="msg-files">{"".join(chip_parts)}</div>',
-                        unsafe_allow_html=True,
-                    )
-                with att_row_r:
-                    if st.button("清空", key=f"clear_attachments_{current_session_id}", use_container_width=True):
-                        state["pending_attachments"] = []
-                        st.rerun()
-
-        # ── Process uploaded files ──
+        # ── Process uploaded files and reset uploader ──
         if uploaded_files:
             for uploaded_file in uploaded_files:
                 filename = uploaded_file.name
@@ -1035,6 +1040,45 @@ def _render_session_panel(
                     if "pending_attachments" not in state:
                         state["pending_attachments"] = []
                     state["pending_attachments"].append({"id": att_id})
+
+            # Reset file uploader by incrementing counter
+            if "file_uploader_counters" not in state:
+                state["file_uploader_counters"] = {}
+            uploader_key = f"file_uploader_{current_session_id}"
+            state["file_uploader_counters"][uploader_key] = state.get("file_uploader_counters", {}).get(uploader_key, 0) + 1
+            st.rerun()
+
+        # ── Row 2: attachment list with clear button ──
+        pending_attachments = state.get("pending_attachments", [])
+        if pending_attachments:
+            chip_parts = []
+            for att in pending_attachments:
+                att_data = _get_attachment_data(att.get("id"))
+                if att_data:
+                    fname = att_data.get("filename", "?")
+                    sz = _format_file_size(att_data.get("file_size", 0))
+                    icon = "\U0001f5bc\ufe0f" if att_data.get("attachment_type") == "image" else "\U0001f4ce"
+                    chip_parts.append(
+                        f'<span class="msg-file-badge">{icon} {html.escape(fname)[:20]} ({sz})</span>'
+                    )
+
+            if chip_parts:
+                # Create a single row with attachments on left, clear button on right
+                att_col1, att_col2 = st.columns([8, 2])
+                with att_col1:
+                    st.markdown(
+                        f'<div class="msg-files" style="display: flex; flex-wrap: nowrap; overflow-x: auto; gap: 6px; margin-bottom: 0;">{" ".join(chip_parts)}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with att_col2:
+                    if st.button("清空附件", key=f"clear_attachments_{current_session_id}", use_container_width=True):
+                        state["pending_attachments"] = []
+                        # Reset file uploader counter as well
+                        if "file_uploader_counters" not in state:
+                            state["file_uploader_counters"] = {}
+                        uploader_key = f"file_uploader_{current_session_id}"
+                        state["file_uploader_counters"][uploader_key] = state.get("file_uploader_counters", {}).get(uploader_key, 0) + 1
+                        st.rerun()
 
         # ── Row 3: input + send (inside form) ──
         with st.form(key=f"chat_form_{current_session_id}", clear_on_submit=True, border=False):
