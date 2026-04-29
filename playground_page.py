@@ -588,7 +588,12 @@ def _render_user_message(content: str, attachments: list[dict[str, Any]] | None 
     if file_badges:
         parts.append(f'<div class="msg-files">{"".join(file_badges)}</div>')
     if safe_text:
-        parts.append(f'<div class="chat-bubble chat-bubble-user"><div class="message-text">{safe_text}</div></div>')
+        parts.append(
+            '<div class="chat-user-wrap">'
+            '<div class="chat-user-avatar">U</div>'
+            f'<div class="chat-bubble chat-bubble-user"><div class="message-text">{safe_text}</div></div>'
+            '</div>'
+        )
 
     if parts:
         st.markdown(
@@ -597,11 +602,9 @@ def _render_user_message(content: str, attachments: list[dict[str, Any]] | None 
         )
 
 
-def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
-    st.markdown(
-        '<div class="chat-meta"><div class="role-icon assistant">AI</div> <span>Assistant</span></div>',
-        unsafe_allow_html=True,
-    )
+def _render_assistant_message(content: str, message_idx: int, is_streaming: bool = False) -> None:
+    with st.container(key=f"pg_asst_{message_idx}"):
+        st.markdown('<div class="chat-meta"><div class="role-icon assistant">AI</div> <span>Assistant</span></div>', unsafe_allow_html=True)
     text = content or ""
     thinking_parts = THINKING_PATTERN.findall(text)
     content_without_thinking = THINKING_PATTERN.sub("", text).strip()
@@ -610,38 +613,12 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
         with st.expander(f"思考过程 #{idx + 1}", expanded=False):
             st.markdown(think)
 
-    if not content_without_thinking and is_streaming:
-        st.markdown(
-            '<div class="chat-row chat-row-assistant">'
-            '<div class="chat-bubble chat-bubble-assistant"><span class="chat-stream-cursor">▌</span></div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        return
+        if not content_without_thinking and is_streaming:
+            st.markdown('<div class="chat-stream-cursor">▌</div>', unsafe_allow_html=True)
+            return
 
-    st.markdown(
-        '<div class="chat-row chat-row-assistant">'
-        '<div class="chat-bubble chat-bubble-assistant">',
-        unsafe_allow_html=True,
-    )
-    cursor = 0
-    for match in CODE_BLOCK_PATTERN.finditer(content_without_thinking):
-        start, end = match.span()
-        if start > cursor:
-            plain_text = content_without_thinking[cursor:start]
-            if plain_text.strip():
-                st.markdown(plain_text)
-
-        lang = (match.group(1) or "text").strip()
-        code = match.group(2) or ""
-        st.code(code, language=lang)
-        cursor = end
-
-    if cursor < len(content_without_thinking):
-        tail = content_without_thinking[cursor:]
-        if tail.strip() or is_streaming:
-            st.markdown(tail + (" ▌" if is_streaming else ""))
-    st.markdown('</div></div>', unsafe_allow_html=True)
+        tail_cursor = " ▌" if is_streaming else ""
+        st.markdown(content_without_thinking + tail_cursor)
 
 def _render_error_message(content: str) -> None:
     st.error(content or "未知错误")
@@ -669,7 +646,7 @@ def _render_messages(messages: list[dict[str, Any]], current_session_streaming: 
             _render_user_message(content, attachments)
         elif role == "assistant":
             is_streaming = current_session_streaming and idx == len(messages) - 1
-            _render_assistant_message(content, is_streaming=is_streaming)
+            _render_assistant_message(content, message_idx=idx, is_streaming=is_streaming)
         elif role == "system":
             st.info(content)
         elif role == "error":
@@ -680,63 +657,129 @@ def _apply_page_style() -> None:
     st.markdown(
         """
         <style>
+        :root {
+            --pg-bg: #0b1220;
+            --pg-surface: #111a2e;
+            --pg-surface-soft: #18243c;
+            --pg-border: rgba(148, 163, 184, 0.25);
+            --pg-text: #dbe5f5;
+            --pg-muted: #9fb0c8;
+            --pg-accent: #4f8cff;
+            --pg-accent-strong: #2e6fff;
+            --pg-user-gradient: linear-gradient(135deg, #2f7bff 0%, #1f5de2 100%);
+        }
         html, body {
             overflow: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
             overflow: hidden !important;
+            background: radial-gradient(circle at top, #1b2b4a 0%, var(--pg-bg) 38%) !important;
         }
         [data-testid="stMain"] {
             overflow: hidden !important;
         }
         .block-container {
-            padding-top: 0.55rem;
-            padding-bottom: 9.5rem;
+            padding-top: 0.4rem;
+            padding-bottom: 10rem;
             max-width: 1380px;
             height: calc(100vh - 1rem);
             overflow: hidden;
         }
+        .block-container h3, .block-container p, .block-container span, .block-container label {
+            color: var(--pg-text);
+        }
         .block-container h3 {
-            margin-top: 0.1rem;
-            margin-bottom: 0.25rem;
+            margin-top: 0.08rem;
+            margin-bottom: 0.16rem;
+            letter-spacing: -0.01em;
         }
         [data-testid="stCaptionContainer"] {
             margin-top: 0;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.28rem;
+            color: var(--pg-muted) !important;
+        }
+        .st-key-pg_chat_scroll {
+            border: 1px solid var(--pg-border);
+            background: rgba(7, 12, 24, 0.55);
+            border-radius: 16px;
+            padding: 0.55rem 0.8rem;
         }
         .chat-row {
             display: flex;
             width: 100%;
-            margin-bottom: 0.85rem;
+            margin-bottom: 0.95rem;
         }
         .chat-row-user {
             justify-content: flex-end;
         }
         .chat-row-assistant {
             justify-content: flex-start;
+            max-width: 960px;
         }
         .chat-bubble {
-            border-radius: 16px;
-            padding: 0.75rem 0.95rem;
+            border-radius: 14px;
+            padding: 0.82rem 0.98rem;
             word-break: break-word;
             line-height: 1.5;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
         }
         .chat-bubble-user {
-            max-width: 75%;
-            background: #1f6feb;
+            max-width: 72%;
+            background: var(--pg-user-gradient);
             color: #fff;
-            border-bottom-right-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-bottom-right-radius: 6px;
         }
         .chat-bubble-assistant {
             width: 100%;
-            background: #f6f8fb;
-            border: 1px solid #e6ebf2;
-            border-bottom-left-radius: 4px;
+            background: linear-gradient(180deg, rgba(22, 33, 57, 0.95) 0%, rgba(15, 24, 43, 0.95) 100%);
+            border: 1px solid var(--pg-border);
+            border-bottom-left-radius: 6px;
+            color: var(--pg-text);
+        }
+        .chat-user-wrap {
+            display: flex;
+            align-items: flex-end;
+            gap: 0.5rem;
+            justify-content: flex-end;
+            width: 100%;
+        }
+        .chat-user-avatar {
+            width: 1.5rem;
+            height: 1.5rem;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: #d8e6ff;
+            background: rgba(79, 140, 255, 0.22);
+            border: 1px solid rgba(79, 140, 255, 0.4);
+            flex: 0 0 auto;
+        }
+        [class*="st-key-pg_asst_"] {
+            width: min(960px, 100%);
+            border: 1px solid var(--pg-border);
+            background: rgba(11, 19, 34, 0.45);
+            border-radius: 14px;
+            padding: 0.58rem 0.72rem 0.52rem 0.72rem;
+            box-shadow: 0 10px 26px rgba(0, 0, 0, 0.22);
+            margin-bottom: 0.9rem;
+        }
+        [class*="st-key-pg_asst_"] [data-testid="stMarkdownContainer"] p,
+        [class*="st-key-pg_asst_"] [data-testid="stMarkdownContainer"] li {
+            color: var(--pg-text) !important;
+            line-height: 1.58;
+        }
+        [class*="st-key-pg_asst_"] [data-testid="stCodeBlock"] {
+            border-radius: 10px;
+            border: 1px solid rgba(148, 163, 184, 0.2);
         }
         .chat-empty-state {
             text-align: center;
             margin-top: 3.5rem;
-            color: #6b7280;
+            color: var(--pg-muted);
         }
         .chat-stream-cursor {
             color: #f8fafc;
@@ -746,13 +789,13 @@ def _apply_page_style() -> None:
         }
         .chat-meta {
             font-size: 0.85rem;
-            color: #6b7280;
-            margin-bottom: 0.35rem;
+            color: var(--pg-muted);
+            margin-bottom: 0.42rem;
         }
         .chat-meta {
         font-size: 12px;
         font-weight: 500;
-        color: #6b7280;
+        color: var(--pg-muted);
         margin-bottom: 6px;
         display: flex;
         align-items: center;
@@ -769,9 +812,9 @@ def _apply_page_style() -> None:
         font-weight: 700;
     }
     .role-icon.assistant {
-        background: rgba(255,215,0,0.22);
-        color: #FFD700;
-        border: 1px solid rgba(255,215,0,0.22);
+        background: rgba(79,140,255,0.18);
+        color: #9ec1ff;
+        border: 1px solid rgba(79,140,255,0.26);
     }
     .msg-files {
         display: flex;
@@ -783,41 +826,68 @@ def _apply_page_style() -> None:
         display: flex;
         align-items: center;
         gap: 5px;
-        background: rgba(255,215,0,0.12);
-        border: 1px solid rgba(255,215,0,0.22);
+        background: rgba(79,140,255,0.18);
+        border: 1px solid rgba(79,140,255,0.28);
         border-radius: 6px;
         padding: 3px 8px;
         font-size: 12px;
-        color: #FFD700;
+        color: #c9ddff;
     }
     .st-key-pg_dock {
             position: sticky;
-            bottom: 4.0rem;
+            bottom: 3.8rem;
             z-index: 20;
-            padding: 0.55rem 0 0.2rem 0;
+            padding: 0.45rem 0 0.15rem 0;
             transform: translateY(-14px);
-            backdrop-filter: blur(6px);
-            background: rgba(10, 14, 30, 0.72);
-            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(8px);
+            background: transparent;
+            border-top: none;
+        }
+        .st-key-pg_dock > div {
+            background: linear-gradient(180deg, rgba(18, 28, 48, 0.95) 0%, rgba(11, 19, 35, 0.96) 100%);
+            border: 1px solid var(--pg-border);
+            border-radius: 16px;
+            padding: 0.55rem 0.7rem 0.6rem 0.7rem;
+            box-shadow: 0 16px 35px rgba(0, 0, 0, 0.35);
+        }
+        .st-key-pg_dock [data-testid="stHorizontalBlock"] {
+            align-items: center;
+        }
+        .st-key-pg_dock [data-testid="stForm"] {
+            background: rgba(11, 18, 33, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            border-radius: 14px;
+            padding: 0.4rem 0.45rem 0.3rem 0.45rem;
         }
         .st-key-pg_dock [data-baseweb="select"] {
             margin-bottom: 0;
         }
+        .st-key-pg_dock [data-baseweb="select"] > div {
+            border-radius: 999px !important;
+            border-color: rgba(148, 163, 184, 0.35) !important;
+            background: rgba(13, 22, 39, 0.92) !important;
+            min-height: 2.25rem;
+            max-height: 2.25rem;
+            box-shadow: none !important;
+        }
+        .st-key-pg_dock [data-baseweb="select"] span {
+            font-size: 0.84rem;
+        }
         .status-pill {
             width: 100%;
-            height: 2.5rem;
-            border-radius: 8px;
+            height: 2.25rem;
+            border-radius: 999px;
             display: flex;
             align-items: center;
             padding: 0 0.9rem;
             font-weight: 600;
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(148, 163, 184, 0.28);
             box-sizing: border-box;
             margin-top: 0.15rem;
         }
         .status-pill.idle {
-            color: #86efac;
-            background: rgba(21, 128, 61, 0.28);
+            color: #8ff3b4;
+            background: rgba(16, 122, 72, 0.24);
         }
         .status-pill.streaming {
             color: #93c5fd;
@@ -915,6 +985,25 @@ def _apply_page_style() -> None:
         display: flex;
         align-items: center;
         justify-content: center;
+        color: #bdd1f3;
+    }
+    .st-key-pg_dock input[type="text"] {
+        min-height: 2.7rem;
+        border-radius: 999px !important;
+        border: 1px solid rgba(148, 163, 184, 0.35) !important;
+        background: rgba(13, 22, 39, 0.92) !important;
+        color: #dbe5f5 !important;
+        padding-left: 1rem !important;
+    }
+    .st-key-pg_dock button[kind="secondaryFormSubmit"],
+    .st-key-pg_dock button[kind="primaryFormSubmit"],
+    .st-key-pg_dock button[kind="primary"] {
+        min-height: 2.7rem;
+        border-radius: 999px !important;
+        font-weight: 600 !important;
+    }
+    .st-key-pg_dock [data-testid="stForm"] {
+        margin-top: 0.3rem;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzone"] [data-testid="stFileUploaderDropzoneInstructions"] {
         display: none !important;
@@ -944,7 +1033,7 @@ def _render_session_panel(
         current_session["model"] = text_models[0] if text_models else None
 
     st.markdown("### 模型体验")
-    st.caption("底部输入，支持流式回复。切换历史对话时，后台生成会持续进行。支持添加图片、文档等附件。")
+    st.caption("Hermes 风格输入栏：附件、供应商、模型一体化；支持流式回复与多附件对话。")
 
     with _WORKER_LOCK:
         message_snapshot = [dict(item) for item in current_session["messages"]]
@@ -1170,7 +1259,20 @@ def _render_session_panel(
                 st.rerun()
 
 def render_playground_page() -> None:
-    _apply_page_style()
+    # 真移植版：直接嵌入独立前端页面（Hermes 风格 UI）
+    import os
+    import streamlit.components.v1 as components
+
+    proxy_host = os.getenv("PROXY_HOST", "127.0.0.1")
+    if proxy_host == "0.0.0.0":
+        proxy_host = "127.0.0.1"
+    proxy_port = os.getenv("PROXY_PORT", "8000")
+    ui_url = f"http://{proxy_host}:{proxy_port}/playground-ui"
+
+    st.markdown("### 模型体验")
+    st.caption("已切换为独立前端版（Hermes 风格真移植）。")
+    components.iframe(ui_url, height=780, scrolling=False)
+    return
 
     provider_to_key = _get_provider_to_key()
     if not provider_to_key:

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIProxy Playground</title>
+  <link rel="stylesheet" href="/playground-ui/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="side-head">
+        <div class="title">模型体验</div>
+        <button id="newSessionBtn">+ 新建</button>
+      </div>
+      <div id="sessionList" class="session-list"></div>
+    </aside>
+    <main class="main">
+      <div id="messages" class="messages">
+        <div id="emptyState" class="empty-state">
+          <h2>What can I help with?</h2>
+          <p>选择模型、上传附件，然后开始对话。</p>
+        </div>
+      </div>
+      <div class="composer-wrap">
+        <div id="attachTray" class="attach-tray"></div>
+        <div class="composer-box">
+          <div class="composer-top chips-row">
+            <div class="chip-wrap">
+              <label>Provider</label>
+              <select id="providerSelect"></select>
+            </div>
+            <div class="chip-wrap chip-grow">
+              <label>Model</label>
+              <select id="modelSelect"></select>
+            </div>
+            <input id="fileInput" type="file" multiple hidden>
+            <button id="uploadBtn" class="ghost">Upload</button>
+            <button id="stopBtn" class="ghost">停止</button>
+          </div>
+          <div class="composer-bottom">
+            <textarea id="promptInput" placeholder="输入消息..."></textarea>
+            <button id="sendBtn">发送</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script src="/playground-ui/app.js"></script>
+</body>
+</html>

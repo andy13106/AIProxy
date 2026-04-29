@@ -35,6 +35,7 @@ from services import (
     mark_key_rate_limited,
 )
 from streaming import AnthropicToolStreamGenerator, StreamGenerator
+from playground_web_api import router as playground_web_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Proxy Gateway", lifespan=lifespan)
+app.include_router(playground_web_router)
 security = HTTPBearer(auto_error=False)
 
 # --- 简易内存速率限制 ---

@@ -1,0 +1,153 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: radial-gradient(circle at top, #1c2a47 0%, #0a1220 40%);
+  color: #dbe7ff;
+}
+.layout { height: 100vh; display: flex; }
+.sidebar {
+  width: 260px;
+  border-right: 1px solid rgba(160, 180, 220, 0.2);
+  background: rgba(14, 22, 38, 0.8);
+  padding: 12px;
+}
+.side-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.side-head .title { font-weight: 700; font-size: 14px; }
+.side-head button {
+  border: 1px solid rgba(160,180,220,.3);
+  border-radius: 999px;
+  background: rgba(60,90,150,.25);
+  color: #cde0ff;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.session-list { display: flex; flex-direction: column; gap: 8px; overflow: auto; max-height: calc(100vh - 70px); }
+.session-item {
+  border: 1px solid rgba(160,180,220,.2);
+  border-radius: 10px;
+  padding: 8px;
+  cursor: pointer;
+  background: rgba(11, 18, 32, 0.7);
+}
+.session-item.active { border-color: rgba(92,145,255,.8); background: rgba(35,60,110,.35); }
+.main { flex: 1; display: flex; flex-direction: column; padding: 12px 16px; gap: 10px; min-width: 0; }
+.messages {
+  flex: 1;
+  overflow: auto;
+  border: 1px solid rgba(160,180,220,.2);
+  border-radius: 14px;
+  background: rgba(8, 14, 26, 0.6);
+  padding: 14px 16px;
+}
+.msg { margin-bottom: 12px; }
+.msg.user { display: flex; justify-content: flex-end; }
+.msg.assistant { display: flex; }
+.bubble {
+  border-radius: 14px;
+  padding: 10px 12px;
+  line-height: 1.55;
+  max-width: 78%;
+  white-space: pre-wrap;
+}
+.assistant-meta {
+  color: #95a9cc;
+  font-size: 12px;
+  margin-bottom: 5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.assistant-meta .dot {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  border: 1px solid rgba(120, 160, 255, 0.4);
+  background: rgba(72, 114, 210, 0.25);
+}
+.user .bubble {
+  background: linear-gradient(135deg, #2d77ff 0%, #1f5de0 100%);
+  border: 1px solid rgba(255,255,255,.18);
+}
+.assistant .bubble {
+  max-width: 100%;
+  background: rgba(16, 25, 45, 0.82);
+  border: 1px solid rgba(160,180,220,.25);
+}
+.assistant-wrap {
+  width: min(920px, 100%);
+  border: 1px solid rgba(160,180,220,.2);
+  border-radius: 14px;
+  background: rgba(9, 16, 30, .45);
+  padding: 8px 10px;
+}
+.empty-state {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #95a9cc;
+}
+.empty-state h2 { margin: 0 0 8px 0; color: #cfdfff; }
+.attach-tray { display: flex; flex-wrap: wrap; gap: 6px; }
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(110,160,255,.38);
+  background: rgba(76,120,220,.2);
+  color: #cfe2ff;
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.composer-wrap { position: sticky; bottom: 0; }
+.composer-box {
+  border: 1px solid rgba(160,180,220,.25);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(20, 30, 52, 0.95) 0%, rgba(11, 19, 36, 0.97) 100%);
+  padding: 10px;
+  box-shadow: 0 14px 30px rgba(0,0,0,.35);
+}
+.composer-top, .composer-bottom {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.composer-top { margin-bottom: 8px; }
+.chips-row { gap: 10px; }
+.chip-wrap { display: flex; align-items: center; gap: 6px; }
+.chip-wrap label { font-size: 11px; color: #91a5ca; }
+.chip-wrap.chip-grow { flex: 1; min-width: 200px; }
+select, textarea, button {
+  border-radius: 999px;
+  border: 1px solid rgba(160,180,220,.28);
+  background: rgba(12, 20, 38, 0.9);
+  color: #dbe7ff;
+}
+select { height: 36px; padding: 0 10px; min-width: 150px; }
+textarea {
+  flex: 1;
+  min-height: 44px;
+  max-height: 130px;
+  resize: vertical;
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+button { height: 36px; padding: 0 14px; cursor: pointer; }
+button#sendBtn { background: #2f75ff; border-color: #4f8fff; font-weight: 600; }
+button.ghost { background: rgba(16, 26, 46, 0.8); }
+pre {
+  margin: 8px 0;
+  border: 1px solid rgba(160,180,220,.2);
+  background: rgba(5, 10, 20, .9);
+  border-radius: 10px;
+  padding: 10px;
+  overflow: auto;
+}
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
