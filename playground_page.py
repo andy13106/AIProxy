@@ -598,21 +598,26 @@ def _render_user_message(content: str, attachments: list[dict[str, Any]] | None 
 
 
 def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
+    text = content or ""
+    
+    if not text.strip() and is_streaming:
+        st.markdown(
+            '<div class="chat-row chat-row-assistant"><div class="chat-meta"><div class="role-icon assistant">AI</div> <span>Assistant</span></div><span class="chat-stream-cursor">▌</span></div>',
+            unsafe_allow_html=True,
+        )
+        return
+    
     st.markdown(
         '<div class="chat-meta"><div class="role-icon assistant">AI</div> <span>Assistant</span></div>',
         unsafe_allow_html=True,
     )
-    text = content or ""
+    
     thinking_parts = THINKING_PATTERN.findall(text)
     content_without_thinking = THINKING_PATTERN.sub("", text).strip()
 
     for idx, think in enumerate(thinking_parts):
         with st.expander(f"思考过程 #{idx + 1}", expanded=False):
             st.markdown(think)
-
-    if not content_without_thinking and is_streaming:
-        st.markdown('<span class="chat-stream-cursor">▌</span>', unsafe_allow_html=True)
-        return
 
     st.markdown('<div class="chat-bubble chat-bubble-assistant">', unsafe_allow_html=True)
     cursor = 0
@@ -660,13 +665,7 @@ def _render_messages(messages: list[dict[str, Any]], current_session_streaming: 
             _render_user_message(content, attachments)
         elif role == "assistant":
             is_streaming = current_session_streaming and idx == len(messages) - 1
-            if is_streaming and not str(content).strip():
-                st.markdown(
-                    '<div class="chat-row chat-row-assistant"><div class="chat-stream-cursor">▌</div></div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                _render_assistant_message(content, is_streaming=is_streaming)
+            _render_assistant_message(content, is_streaming=is_streaming)
         elif role == "system":
             st.info(content)
         elif role == "error":
@@ -875,19 +874,39 @@ def _apply_page_style() -> None:
             opacity: 1;
         }
         /* ── Compact file uploader in dock ── */
+    .st-key-pg_dock [data-testid="stFileUploader"] {
+        min-height: unset !important;
+        height: 2.5rem !important;
+    }
     .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileUploaderFile"],
-    .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileInfo"] {
+    .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileInfo"],
+    .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileUploaderStatus"] {
         display: none !important;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzone"] {
-        min-height: 1.8rem;
-        padding: 2px 6px;
+        min-height: 2.5rem !important;
+        height: 2.5rem !important;
+        padding: 0 8px !important;
+        border: none !important;
+        background: transparent !important;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzone"] > section {
-        padding: 2px 4px;
+        padding: 0 !important;
+        height: 100% !important;
+        display: flex !important;
+        align-items: center !important;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] {
-        font-size: 0.75rem;
+        font-size: 0.75rem !important;
+        padding: 0 !important;
+        height: 100% !important;
+        display: flex !important;
+        align-items: center !important;
+    }
+    .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] > div:first-child {
+        display: flex !important;
+        align-items: center !important;
+        height: 100% !important;
     }
     </style>
         """,
@@ -924,6 +943,21 @@ def _render_session_panel(
     chat_scroll = st.container(height=560, key="pg_chat_scroll", autoscroll=True)
     with chat_scroll:
         _render_messages(message_snapshot, current_streaming)
+    
+    st.markdown(
+        """
+        <script>
+        function scrollToBottom() {
+            const chatContainer = document.querySelector('[data-testid="stVerticalBlock"]');
+            if (chatContainer) {
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+        }
+        scrollToBottom();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
     with st.container(key="pg_dock"):
         # ── Row 1: provider | model | upload | stop/idle ──
