@@ -611,7 +611,7 @@ def _render_assistant_message(content: str, is_streaming: bool = False) -> None:
             st.markdown(think)
 
     if not content_without_thinking and is_streaming:
-        st.markdown('<span class="chat-stream-cursor">▌</span>', unsafe_allow_html=True)
+        st.markdown('<div class="chat-bubble chat-bubble-assistant"><span class="chat-stream-cursor">▌</span></div>', unsafe_allow_html=True)
         return
 
     st.markdown('<div class="chat-bubble chat-bubble-assistant">', unsafe_allow_html=True)
@@ -662,7 +662,7 @@ def _render_messages(messages: list[dict[str, Any]], current_session_streaming: 
             is_streaming = current_session_streaming and idx == len(messages) - 1
             if is_streaming and not str(content).strip():
                 st.markdown(
-                    '<div class="chat-row chat-row-assistant"><div class="chat-stream-cursor">▌</div></div>',
+                    '<div class="chat-row chat-row-assistant"><div class="chat-bubble chat-bubble-assistant"><div class="chat-stream-cursor">▌</div></div></div>',
                     unsafe_allow_html=True,
                 )
             else:
@@ -736,7 +736,7 @@ def _apply_page_style() -> None:
             color: #6b7280;
         }
         .chat-stream-cursor {
-            color: #f8fafc;
+            color: #333;
             font-size: 1.2rem;
             line-height: 1;
             padding: 0.1rem 0.3rem;
@@ -879,15 +879,26 @@ def _apply_page_style() -> None:
     .st-key-pg_dock [data-testid="stFileUploader"] [data-testid="stFileInfo"] {
         display: none !important;
     }
+    .st-key-pg_dock [data-testid="stFileUploader"] {
+        min-height: 2.5rem;
+        display: flex;
+        align-items: center;
+    }
     .st-key-pg_dock [data-testid="stFileUploaderDropzone"] {
-        min-height: 1.8rem;
+        min-height: 2.5rem;
         padding: 2px 6px;
+        display: flex;
+        align-items: center;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzone"] > section {
         padding: 2px 4px;
+        display: flex;
+        align-items: center;
     }
     .st-key-pg_dock [data-testid="stFileUploaderDropzoneInput"] {
         font-size: 0.75rem;
+        display: flex;
+        align-items: center;
     }
     </style>
         """,
@@ -924,6 +935,8 @@ def _render_session_panel(
     chat_scroll = st.container(height=560, key="pg_chat_scroll", autoscroll=True)
     with chat_scroll:
         _render_messages(message_snapshot, current_streaming)
+        # 强制滚动到底部
+        st.markdown('<script>window.scrollTo(0, document.body.scrollHeight);</script>', unsafe_allow_html=True)
 
     with st.container(key="pg_dock"):
         # ── Row 1: provider | model | upload | stop/idle ──
@@ -972,6 +985,7 @@ def _render_session_panel(
                 key=f"{uploader_key}_{uploader_counter}",
                 accept_multiple_files=True,
                 label_visibility="collapsed",
+                help=None
             )
 
         with cfg4:
@@ -982,30 +996,13 @@ def _render_session_panel(
             else:
                 st.markdown('<div class="status-pill idle">空闲</div>', unsafe_allow_html=True)
 
-        # ── Row 2: attachment chips (only when there are pending attachments) ──
+        # ── Row 2: attachment management ──
         pending_attachments = state.get("pending_attachments", [])
         if pending_attachments:
-            chip_parts = []
-            for att in pending_attachments:
-                att_data = _get_attachment_data(att.get("id"))
-                if att_data:
-                    fname = att_data.get("filename", "?")
-                    sz = _format_file_size(att_data.get("file_size", 0))
-                    icon = "\U0001f5bc\ufe0f" if att_data.get("attachment_type") == "image" else "\U0001f4ce"
-                    chip_parts.append(
-                        f'<span class="msg-file-badge">{icon} {html.escape(fname)[:20]} ({sz})</span>'
-                    )
-            if chip_parts:
-                att_row_l, att_row_r = st.columns([10, 2])
-                with att_row_l:
-                    st.markdown(
-                        f'<div class="msg-files">{"".join(chip_parts)}</div>',
-                        unsafe_allow_html=True,
-                    )
-                with att_row_r:
-                    if st.button("清空", key=f"clear_attachments_{current_session_id}", use_container_width=True):
-                        state["pending_attachments"] = []
-                        st.rerun()
+            with st.columns([1])[0]:
+                if st.button("清空附件", key=f"clear_attachments_{current_session_id}", use_container_width=True):
+                    state["pending_attachments"] = []
+                    st.rerun()
 
         # ── Process uploaded files ──
         if uploaded_files:
