@@ -32,6 +32,7 @@ _MODEL_CACHE: dict[str, list[str]] = {}
 _MODEL_CACHE_TS: dict[str, datetime.datetime] = {}
 _MODEL_CACHE_TTL_SEC = 120
 _STREAM_STOP_FLAGS: dict[str, bool] = {}
+_NO_STORE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
 
 
 def _now_utc() -> datetime.datetime:
@@ -268,17 +269,17 @@ def _build_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 @router.get("/playground-ui")
 def playground_ui() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "index.html")
+    return FileResponse(_STATIC_DIR / "index.html", headers=_NO_STORE_HEADERS)
 
 
 @router.get("/playground-ui/style.css")
 def playground_ui_css() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "style.css")
+    return FileResponse(_STATIC_DIR / "style.css", headers=_NO_STORE_HEADERS)
 
 
 @router.get("/playground-ui/app.js")
 def playground_ui_js() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "app.js")
+    return FileResponse(_STATIC_DIR / "app.js", headers=_NO_STORE_HEADERS)
 
 
 @router.get("/playground-api/bootstrap")

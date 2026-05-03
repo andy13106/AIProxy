@@ -8,6 +8,15 @@ const S = {
 
 const $ = (id) => document.getElementById(id);
 
+function applyThemeFromQuery() {
+  const theme = new URLSearchParams(window.location.search).get("theme");
+  if (theme === "light" || theme === "dark") {
+    document.documentElement.setAttribute("data-theme", theme);
+    return;
+  }
+  document.documentElement.removeAttribute("data-theme");
+}
+
 function escapeHtml(text) {
   const d = document.createElement("div");
   d.textContent = text || "";
@@ -20,13 +29,68 @@ function renderSessions() {
   const ids = Object.keys(S.sessions).reverse();
   for (const sid of ids) {
     const s = S.sessions[sid];
+    const title = s.title || "新对话";
     const el = document.createElement("div");
     el.className = `session-item ${sid === S.currentSessionId ? "active" : ""}`;
-    el.textContent = s.title || "新对话";
+    el.style.position = "relative";
     el.onclick = () => {
       S.currentSessionId = sid;
       renderAll();
     };
+
+    const titleEl = document.createElement("span");
+    titleEl.className = "session-title";
+    titleEl.textContent = title;
+    titleEl.style.paddingRight = "54px";
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "session-delete";
+    delBtn.title = "删除会话";
+    delBtn.textContent = "删除";
+    delBtn.style.cssText = [
+      "display:inline-flex",
+      "align-items:center",
+      "justify-content:center",
+      "position:absolute",
+      "right:10px",
+      "top:50%",
+      "transform:translateY(-50%)",
+      "width:42px",
+      "height:26px",
+      "min-width:42px",
+      "padding:0",
+      "margin:0",
+      "border-radius:8px",
+      "border:1px solid rgba(236,101,101,0.55)",
+      "background:rgba(96,30,30,0.62)",
+      "color:#ffdede",
+      "font-size:12px",
+      "font-weight:600",
+      "line-height:1",
+      "cursor:pointer",
+      "opacity:1",
+      "visibility:visible",
+      "flex:0 0 auto",
+      "z-index:2"
+    ].join(";");
+    delBtn.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm("确认删除这个会话吗？")) return;
+      await api(`/playground-api/session/${encodeURIComponent(sid)}`, { method: "DELETE" });
+      delete S.sessions[sid];
+      if (S.currentSessionId === sid) {
+        const remain = Object.keys(S.sessions);
+        if (remain.length) {
+          S.currentSessionId = remain[remain.length - 1];
+        } else {
+          await bootstrap();
+        }
+      }
+      renderAll();
+    };
+    el.appendChild(titleEl);
+    el.appendChild(delBtn);
     box.appendChild(el);
   }
 }
@@ -110,12 +174,38 @@ function renderMarkdown(text) {
 function renderAttachTray() {
   const tray = $("attachTray");
   tray.innerHTML = "";
-  for (const att of S.pendingAttachments) {
+  S.pendingAttachments.forEach((att, idx) => {
     const chip = document.createElement("div");
     chip.className = "attach-chip";
-    chip.textContent = `${att.filename}`;
+    chip.innerHTML = `<span>${escapeHtml(att.filename || "附件")}</span><button class="attach-remove" data-idx="${idx}" title="移除">✕</button>`;
     tray.appendChild(chip);
-  }
+  });
+  tray.querySelectorAll(".attach-remove").forEach((btn) => {
+    btn.style.cssText = [
+      "display:inline-flex",
+      "align-items:center",
+      "justify-content:center",
+      "width:18px",
+      "height:18px",
+      "min-width:18px",
+      "padding:0",
+      "border:none",
+      "border-radius:999px",
+      "background:rgba(255,255,255,0.12)",
+      "color:#ffffff",
+      "font-size:12px",
+      "line-height:1",
+      "cursor:pointer",
+      "opacity:1",
+      "visibility:visible"
+    ].join(";");
+    btn.onclick = () => {
+      const idx = Number(btn.dataset.idx);
+      if (Number.isNaN(idx)) return;
+      S.pendingAttachments.splice(idx, 1);
+      renderAttachTray();
+    };
+  });
 }
 
 function renderAll() {
@@ -282,6 +372,30 @@ function setBusy(busy) {
   $("uploadBtn").disabled = !!busy;
   $("providerSelect").disabled = !!busy;
   $("modelSelect").disabled = !!busy;
+  $("stopBtn").disabled = !S.currentStreamId;
 }
 
-bootstrap().then(bindEvents);
+function bindInputUX() {
+  const prompt = $("promptInput");
+  if (!prompt) return;
+  const resize = () => {
+    prompt.style.height = "auto";
+    prompt.style.height = `${Math.min(prompt.scrollHeight, 160)}px`;
+  };
+  prompt.addEventListener("input", resize);
+  prompt.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      await sendMessage();
+    }
+  });
+  resize();
+}
+
+applyThemeFromQuery();
+
+bootstrap().then(() => {
+  bindEvents();
+  bindInputUX();
+  setBusy(false);
+});

@@ -1032,9 +1032,6 @@ def _render_session_panel(
     if current_session.get("model") not in text_models:
         current_session["model"] = text_models[0] if text_models else None
 
-    st.markdown("### 模型体验")
-    st.caption("Hermes 风格输入栏：附件、供应商、模型一体化；支持流式回复与多附件对话。")
-
     with _WORKER_LOCK:
         message_snapshot = [dict(item) for item in current_session["messages"]]
         current_streaming = bool(current_session.get("is_streaming", False))
@@ -1259,19 +1256,84 @@ def _render_session_panel(
                 st.rerun()
 
 def render_playground_page() -> None:
-    # 真移植版：直接嵌入独立前端页面（Hermes 风格 UI）
     import os
-    import streamlit.components.v1 as components
 
     proxy_host = os.getenv("PROXY_HOST", "127.0.0.1")
     if proxy_host == "0.0.0.0":
         proxy_host = "127.0.0.1"
     proxy_port = os.getenv("PROXY_PORT", "8000")
-    ui_url = f"http://{proxy_host}:{proxy_port}/playground-ui"
+    static_dir = os.path.join(os.path.dirname(__file__), "playground_web_static")
+    version_files = [
+        __file__,
+        os.path.join(static_dir, "index.html"),
+        os.path.join(static_dir, "style.css"),
+        os.path.join(static_dir, "app.js"),
+    ]
+    ui_ver = int(max(os.path.getmtime(p) for p in version_files if os.path.exists(p)))
+    def _normalize_theme(value: Any) -> str | None:
+        if value is None:
+            return None
+        v = str(value).strip().lower()
+        if "light" in v:
+            return "light"
+        if "dark" in v:
+            return "dark"
+        return None
 
-    st.markdown("### 模型体验")
-    st.caption("已切换为独立前端版（Hermes 风格真移植）。")
-    components.iframe(ui_url, height=780, scrolling=False)
+    theme_type: str | None = None
+    try:
+        ctx_theme = getattr(st.context, "theme", None)
+        theme_type = _normalize_theme(getattr(ctx_theme, "type", None))
+        if theme_type is None:
+            theme_type = _normalize_theme(getattr(ctx_theme, "base", None))
+    except Exception:
+        theme_type = None
+
+    if theme_type is None:
+        theme_type = _normalize_theme(st.get_option("theme.base")) or "dark"
+    ui_url = f"http://{proxy_host}:{proxy_port}/playground-ui?v={ui_ver}&theme={theme_type}"
+
+    if "playground_last_theme_type" not in st.session_state:
+        st.session_state.playground_last_theme_type = theme_type
+
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every="1s")
+        def _theme_watcher() -> None:
+            current_theme: str | None = None
+            try:
+                ctx_theme = getattr(st.context, "theme", None)
+                current_theme = _normalize_theme(getattr(ctx_theme, "type", None))
+                if current_theme is None:
+                    current_theme = _normalize_theme(getattr(ctx_theme, "base", None))
+            except Exception:
+                current_theme = None
+            if current_theme is None:
+                current_theme = _normalize_theme(st.get_option("theme.base")) or "dark"
+
+            if current_theme != st.session_state.get("playground_last_theme_type"):
+                st.session_state.playground_last_theme_type = current_theme
+                st.rerun()
+
+        _theme_watcher()
+
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            max-width: 100%;
+            padding-top: 0.5rem;
+            padding-bottom: 0.5rem;
+            padding-left: 0.5rem;
+            padding-right: 0.5rem;
+        }
+        div[data-testid="stIFrame"] iframe {
+            height: calc(100vh - 4.2rem) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.iframe(ui_url, height=960)
     return
 
     provider_to_key = _get_provider_to_key()
