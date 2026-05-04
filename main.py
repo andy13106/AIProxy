@@ -6,8 +6,11 @@ import time
 import atexit
 import signal
 import threading
+import platform
 
 from dotenv import load_dotenv
+
+IS_WINDOWS = platform.system() == "Windows"
 
 try:
     from playground_page import cleanup_threads
@@ -130,10 +133,15 @@ def start_services() -> None:
     if selected_admin_port is not None:
         print("Admin panel: " f"http://{admin_host}:{selected_admin_port}")
         
-        def set_new_process_group():
-            os.setpgrp()
-        
-        frontend_process = subprocess.Popen(frontend_cmd, preexec_fn=set_new_process_group)
+        if IS_WINDOWS:
+            frontend_process = subprocess.Popen(
+                frontend_cmd,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            def set_new_process_group():
+                os.setpgrp()
+            frontend_process = subprocess.Popen(frontend_cmd, preexec_fn=set_new_process_group)
 
     print("\nServices started. Press Ctrl+C to stop.")
 
@@ -148,12 +156,20 @@ def start_services() -> None:
         
         if frontend_process is not None and frontend_process.poll() is None:
             try:
-                os.killpg(os.getpgid(frontend_process.pid), signal.SIGTERM)
-                try:
-                    frontend_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(os.getpgid(frontend_process.pid), signal.SIGKILL)
-                    frontend_process.wait()
+                if IS_WINDOWS:
+                    frontend_process.send_signal(signal.CTRL_BREAK_EVENT)
+                    try:
+                        frontend_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        frontend_process.kill()
+                        frontend_process.wait()
+                else:
+                    os.killpg(os.getpgid(frontend_process.pid), signal.SIGTERM)
+                    try:
+                        frontend_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(os.getpgid(frontend_process.pid), signal.SIGKILL)
+                        frontend_process.wait()
             except Exception:
                 try:
                     frontend_process.terminate()
