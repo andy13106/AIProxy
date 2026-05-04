@@ -380,7 +380,7 @@ function bindInputUX() {
   if (!prompt) return;
   const resize = () => {
     prompt.style.height = "auto";
-    prompt.style.height = `${Math.min(prompt.scrollHeight, 160)}px`;
+    prompt.style.height = `${Math.min(prompt.scrollHeight, 120)}px`;
   };
   prompt.addEventListener("input", resize);
   prompt.addEventListener("keydown", async (e) => {
@@ -393,6 +393,14 @@ function bindInputUX() {
 }
 
 applyThemeFromQuery();
+
+function fitLayout() {
+  const h = window.innerHeight;
+  document.documentElement.style.height = h + "px";
+  document.body.style.height = h + "px";
+}
+fitLayout();
+window.addEventListener("resize", fitLayout);
 
 bootstrap().then(() => {
   bindEvents();

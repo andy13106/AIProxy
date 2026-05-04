@@ -1320,20 +1320,40 @@ def render_playground_page() -> None:
         """
         <style>
         .block-container {
-            max-width: 100%;
-            padding-top: 0.5rem;
-            padding-bottom: 0.5rem;
-            padding-left: 0.5rem;
-            padding-right: 0.5rem;
+            max-width: 100% !important;
+            padding: 0 !important;
+        }
+        div[data-testid="stIFrame"] {
+            position: fixed !important;
+            top: 3.5rem;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            width: 100% !important;
+            height: auto !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            border: none !important;
+            z-index: 999;
+        }
+        div[data-testid="stIFrame"] > div {
+            padding: 0 !important;
+            margin: 0 !important;
+            height: 100% !important;
         }
         div[data-testid="stIFrame"] iframe {
-            height: calc(100vh - 4.2rem) !important;
+            height: 100% !important;
+            width: 100% !important;
+            border: none !important;
+            display: block !important;
+            margin: 0 !important;
+            padding: 0 !important;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.iframe(ui_url, height=960)
+    st.iframe(ui_url, height=800)
     return
 
     provider_to_key = _get_provider_to_key()
