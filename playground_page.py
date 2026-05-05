@@ -1317,43 +1317,85 @@ def render_playground_page() -> None:
         _theme_watcher()
 
     st.markdown(
-        """
+        f"""
         <style>
-        .block-container {
+        .block-container {{
             max-width: 100% !important;
             padding: 0 !important;
-        }
-        div[data-testid="stIFrame"] {
-            position: fixed !important;
+        }}
+        section[data-testid="stSidebar"] {{
+            z-index: 1000 !important;
+        }}
+        header[data-testid="stHeader"] {{
+            z-index: 1001 !important;
+        }}
+        #pg-iframe-wrap {{
+            position: fixed;
             top: 3.5rem;
             left: 0;
             right: 0;
             bottom: 0;
-            width: 100% !important;
-            height: auto !important;
-            padding: 0 !important;
-            margin: 0 !important;
-            border: none !important;
-            z-index: 999;
-        }
-        div[data-testid="stIFrame"] > div {
-            padding: 0 !important;
-            margin: 0 !important;
-            height: 100% !important;
-        }
-        div[data-testid="stIFrame"] iframe {
-            height: 100% !important;
-            width: 100% !important;
-            border: none !important;
-            display: block !important;
-            margin: 0 !important;
-            padding: 0 !important;
-        }
+            z-index: 1;
+            overflow: hidden;
+        }}
+        #pg-iframe-wrap iframe {{
+            width: 100%;
+            height: 100%;
+            border: none;
+            display: block;
+        }}
         </style>
+        <div id="pg-iframe-wrap">
+            <iframe src="{ui_url}" id="pg-iframe-el"></iframe>
+        </div>
         """,
         unsafe_allow_html=True,
     )
-    st.iframe(ui_url, height=800)
+
+    # Inject JS via components.v1.html to adjust iframe position based on sidebar
+    st.components.v1.html(
+        """
+        <script>
+        (function() {
+            var wrap = parent.document.getElementById('pg-iframe-wrap');
+            var lastSidebarWidth = 0;
+
+            function getSidebar() {
+                return parent.document.querySelector('section[data-testid="stSidebar"]')
+                    || parent.document.querySelector('[data-testid="stSidebar"]');
+            }
+
+            function adjustLayout() {
+                if (!wrap) {
+                    wrap = parent.document.getElementById('pg-iframe-wrap');
+                }
+                if (!wrap) return;
+                wrap.style.height = (parent.window.innerHeight - 56) + 'px';
+                var sidebar = getSidebar();
+                if (sidebar) {
+                    var w = sidebar.getBoundingClientRect().width || sidebar.offsetWidth || 0;
+                    wrap.style.left = w + 'px';
+                    lastSidebarWidth = w;
+                }
+            }
+
+            adjustLayout();
+            parent.window.addEventListener('resize', adjustLayout);
+
+            setInterval(function() {
+                var sidebar = getSidebar();
+                if (sidebar) {
+                    var w = sidebar.getBoundingClientRect().width || sidebar.offsetWidth || 0;
+                    if (w !== lastSidebarWidth) {
+                        adjustLayout();
+                    }
+                }
+            }, 200);
+        })();
+        </script>
+        """,
+        height=0,
+    )
     return
 
     provider_to_key = _get_provider_to_key()
