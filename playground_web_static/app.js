@@ -32,7 +32,6 @@ function renderSessions() {
     const title = s.title || "新对话";
     const el = document.createElement("div");
     el.className = `session-item ${sid === S.currentSessionId ? "active" : ""}`;
-    el.style.position = "relative";
     el.onclick = () => {
       S.currentSessionId = sid;
       renderAll();
@@ -41,39 +40,12 @@ function renderSessions() {
     const titleEl = document.createElement("span");
     titleEl.className = "session-title";
     titleEl.textContent = title;
-    titleEl.style.paddingRight = "54px";
 
     const delBtn = document.createElement("button");
     delBtn.type = "button";
     delBtn.className = "session-delete";
     delBtn.title = "删除会话";
-    delBtn.textContent = "删除";
-    delBtn.style.cssText = [
-      "display:inline-flex",
-      "align-items:center",
-      "justify-content:center",
-      "position:absolute",
-      "right:10px",
-      "top:50%",
-      "transform:translateY(-50%)",
-      "width:42px",
-      "height:26px",
-      "min-width:42px",
-      "padding:0",
-      "margin:0",
-      "border-radius:8px",
-      "border:1px solid rgba(236,101,101,0.55)",
-      "background:rgba(96,30,30,0.62)",
-      "color:#ffdede",
-      "font-size:12px",
-      "font-weight:600",
-      "line-height:1",
-      "cursor:pointer",
-      "opacity:1",
-      "visibility:visible",
-      "flex:0 0 auto",
-      "z-index:2"
-    ].join(";");
+    delBtn.textContent = "✕";
     delBtn.onclick = async (e) => {
       e.stopPropagation();
       if (!confirm("确认删除这个会话吗？")) return;
@@ -116,38 +88,88 @@ function renderProviders() {
     modelSelect.appendChild(opt);
   }
   if (cur?.model) modelSelect.value = cur.model;
+  
+  updateProviderChip();
+  updateModelChip();
+}
+
+function updateProviderChip() {
+  const providerSelect = $("providerSelect");
+  const providerLabel = $("providerLabel");
+  const providerChip = $("providerChip");
+  if (providerLabel && providerSelect.value) {
+    providerLabel.textContent = providerSelect.value;
+    providerChip.classList.add("active");
+  }
+}
+
+function updateModelChip() {
+  const modelSelect = $("modelSelect");
+  const modelLabel = $("modelLabel");
+  const modelChip = $("modelChip");
+  if (modelLabel && modelSelect.value) {
+    modelLabel.textContent = modelSelect.value;
+    modelChip.classList.add("active");
+  }
 }
 
 function renderMessages() {
   const box = $("messages");
-  box.innerHTML = "";
+  const inner = $("msgInner");
+  const emptyState = $("emptyState");
+  inner.innerHTML = "";
   const cur = currentSession();
   if (!cur || !(cur.messages || []).length) {
-    box.innerHTML = `<div id="emptyState" class="empty-state"><h2>What can I help with?</h2><p>选择模型、上传附件，然后开始对话。</p></div>`;
+    if (emptyState) emptyState.style.display = "flex";
     return;
   }
+  if (emptyState) emptyState.style.display = "none";
   for (const msg of cur.messages || []) {
     const row = document.createElement("div");
-    row.className = `msg ${msg.role === "user" ? "user" : "assistant"}`;
+    row.className = "msg-row";
+    row.setAttribute("data-role", msg.role);
+    
+    const role = document.createElement("div");
+    role.className = `msg-role ${msg.role === "user" ? "user" : "assistant"}`;
+    
+    const icon = document.createElement("span");
+    icon.className = `role-icon ${msg.role === "user" ? "user" : "assistant"}`;
+    icon.textContent = msg.role === "user" ? "U" : "A";
+    
+    const roleText = document.createElement("span");
+    roleText.textContent = msg.role === "user" ? "You" : "Assistant";
+    
+    role.appendChild(icon);
+    role.appendChild(roleText);
+    
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    
     if (msg.role === "assistant") {
-      const wrap = document.createElement("div");
-      wrap.className = "assistant-wrap";
-      const meta = document.createElement("div");
-      meta.className = "assistant-meta";
-      meta.innerHTML = `<span class="dot">AI</span><span>Assistant</span>`;
-      const bubble = document.createElement("div");
-      bubble.className = "bubble";
-      bubble.innerHTML = renderMarkdown(msg.content || "");
-      wrap.appendChild(meta);
-      wrap.appendChild(bubble);
-      row.appendChild(wrap);
+      body.innerHTML = renderMarkdown(msg.content || "");
     } else {
-      const bubble = document.createElement("div");
-      bubble.className = "bubble";
-      bubble.innerHTML = escapeHtml(msg.content || "");
-      row.appendChild(bubble);
+      body.innerHTML = `<p>${escapeHtml(msg.content || "")}</p>`;
     }
-    box.appendChild(row);
+    
+    if (msg.attachments && msg.attachments.length > 0) {
+      const attachDiv = document.createElement("div");
+      attachDiv.style.marginTop = "8px";
+      attachDiv.style.display = "flex";
+      attachDiv.style.gap = "6px";
+      attachDiv.style.flexWrap = "wrap";
+      for (const att of msg.attachments) {
+        const chip = document.createElement("span");
+        chip.className = "attach-chip";
+        chip.style.display = "inline-flex";
+        chip.textContent = att.filename || att.name || "附件";
+        attachDiv.appendChild(chip);
+      }
+      body.appendChild(attachDiv);
+    }
+    
+    row.appendChild(role);
+    row.appendChild(body);
+    inner.appendChild(row);
   }
   box.scrollTop = box.scrollHeight;
 }
@@ -160,20 +182,39 @@ function renderMarkdown(text) {
   let match;
   while ((match = codeFence.exec(src)) !== null) {
     const before = src.slice(cursor, match.index);
-    if (before) out += `<p>${escapeHtml(before).replace(/\n/g, "<br>")}</p>`;
+    if (before) {
+      const paragraphs = before.split(/\n\n+/);
+      for (const p of paragraphs) {
+        if (p.trim()) {
+          out += `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`;
+        }
+      }
+    }
     const lang = escapeHtml(match[1] || "text");
     const code = escapeHtml(match[2] || "");
     out += `<pre><code class="lang-${lang}">${code}</code></pre>`;
     cursor = match.index + match[0].length;
   }
   const tail = src.slice(cursor);
-  if (tail) out += `<p>${escapeHtml(tail).replace(/\n/g, "<br>")}</p>`;
+  if (tail) {
+    const paragraphs = tail.split(/\n\n+/);
+    for (const p of paragraphs) {
+      if (p.trim()) {
+        out += `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`;
+      }
+    }
+  }
   return out || "<p></p>";
 }
 
 function renderAttachTray() {
   const tray = $("attachTray");
   tray.innerHTML = "";
+  if (S.pendingAttachments.length > 0) {
+    tray.classList.add("has-files");
+  } else {
+    tray.classList.remove("has-files");
+  }
   S.pendingAttachments.forEach((att, idx) => {
     const chip = document.createElement("div");
     chip.className = "attach-chip";
@@ -181,24 +222,6 @@ function renderAttachTray() {
     tray.appendChild(chip);
   });
   tray.querySelectorAll(".attach-remove").forEach((btn) => {
-    btn.style.cssText = [
-      "display:inline-flex",
-      "align-items:center",
-      "justify-content:center",
-      "width:18px",
-      "height:18px",
-      "min-width:18px",
-      "padding:0",
-      "border:none",
-      "border-radius:999px",
-      "background:rgba(255,255,255,0.12)",
-      "color:#ffffff",
-      "font-size:12px",
-      "line-height:1",
-      "cursor:pointer",
-      "opacity:1",
-      "visibility:visible"
-    ].join(";");
     btn.onclick = () => {
       const idx = Number(btn.dataset.idx);
       if (Number.isNaN(idx)) return;
@@ -273,6 +296,7 @@ function bindEvents() {
     const cur = currentSession();
     if (!cur) return;
     cur.model = $("modelSelect").value;
+    updateModelChip();
   };
 
   $("uploadBtn").onclick = () => $("fileInput").click();
@@ -288,6 +312,89 @@ function bindEvents() {
   };
 
   $("sendBtn").onclick = sendMessage;
+
+  bindDropdownEvents();
+}
+
+function bindDropdownEvents() {
+  const providerChip = $("providerChip");
+  const modelChip = $("modelChip");
+  const providerDropdown = $("providerDropdown");
+  const modelDropdown = $("modelDropdown");
+
+  function closeAllDropdowns() {
+    if (providerDropdown) providerDropdown.classList.remove("open");
+    if (modelDropdown) modelDropdown.classList.remove("open");
+  }
+
+  function populateProviderDropdown() {
+    if (!providerDropdown) return;
+    providerDropdown.innerHTML = "";
+    for (const p of S.providers) {
+      const opt = document.createElement("div");
+      opt.className = `provider-option ${p.name === $("providerSelect").value ? "selected" : ""}`;
+      opt.textContent = p.name;
+      opt.onclick = () => {
+        $("providerSelect").value = p.name;
+        const cur = currentSession();
+        if (cur) cur.provider = p.name;
+        renderProviders();
+        closeAllDropdowns();
+      };
+      providerDropdown.appendChild(opt);
+    }
+  }
+
+  function populateModelDropdown() {
+    if (!modelDropdown) return;
+    modelDropdown.innerHTML = "";
+    const selectedProvider = S.providers.find((p) => p.name === $("providerSelect").value);
+    const models = selectedProvider?.models || [];
+    for (const m of models) {
+      const opt = document.createElement("div");
+      opt.className = `model-option ${m === $("modelSelect").value ? "selected" : ""}`;
+      opt.textContent = m;
+      opt.onclick = () => {
+        $("modelSelect").value = m;
+        const cur = currentSession();
+        if (cur) cur.model = m;
+        updateModelChip();
+        closeAllDropdowns();
+      };
+      modelDropdown.appendChild(opt);
+    }
+  }
+
+  if (providerChip) {
+    providerChip.onclick = (e) => {
+      e.stopPropagation();
+      populateProviderDropdown();
+      if (providerDropdown) {
+        const isOpen = providerDropdown.classList.contains("open");
+        closeAllDropdowns();
+        if (!isOpen) providerDropdown.classList.add("open");
+      }
+    };
+  }
+
+  if (modelChip) {
+    modelChip.onclick = (e) => {
+      e.stopPropagation();
+      populateModelDropdown();
+      if (modelDropdown) {
+        const isOpen = modelDropdown.classList.contains("open");
+        closeAllDropdowns();
+        if (!isOpen) modelDropdown.classList.add("open");
+      }
+    };
+  }
+
+  document.addEventListener("click", (e) => {
+    if (!providerDropdown?.contains(e.target) && !providerChip?.contains(e.target) &&
+        !modelDropdown?.contains(e.target) && !modelChip?.contains(e.target)) {
+      closeAllDropdowns();
+    }
+  });
 }
 
 async function sendMessage() {
@@ -353,6 +460,7 @@ async function sendMessage() {
       try { data = JSON.parse(dataStr); } catch { continue; }
       if (currentEvent === "ready" && data.stream_id) {
         S.currentStreamId = data.stream_id;
+        setBusy(true);
       }
       if (currentEvent === "token" && data.text) {
         assistantMsg.content += data.text;
@@ -373,6 +481,11 @@ function setBusy(busy) {
   $("providerSelect").disabled = !!busy;
   $("modelSelect").disabled = !!busy;
   $("stopBtn").disabled = !S.currentStreamId;
+  
+  const stopBtn = $("stopBtn");
+  if (stopBtn) {
+    stopBtn.style.display = S.currentStreamId ? "inline-flex" : "none";
+  }
 }
 
 function bindInputUX() {
@@ -380,7 +493,7 @@ function bindInputUX() {
   if (!prompt) return;
   const resize = () => {
     prompt.style.height = "auto";
-    prompt.style.height = `${Math.min(prompt.scrollHeight, 120)}px`;
+    prompt.style.height = `${Math.min(prompt.scrollHeight, 200)}px`;
   };
   prompt.addEventListener("input", resize);
   prompt.addEventListener("keydown", async (e) => {

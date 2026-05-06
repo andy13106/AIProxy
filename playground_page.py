@@ -1322,6 +1322,7 @@ def render_playground_page() -> None:
         .block-container {
             max-width: 100% !important;
             padding: 0 !important;
+            padding-top: 3rem !important;
             flex: 1;
             display: flex;
             flex-direction: column;
