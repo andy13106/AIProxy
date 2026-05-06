@@ -1317,85 +1317,38 @@ def render_playground_page() -> None:
         _theme_watcher()
 
     st.markdown(
-        f"""
+        """
         <style>
-        .block-container {{
+        .block-container {
             max-width: 100% !important;
             padding: 0 !important;
-        }}
-        section[data-testid="stSidebar"] {{
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        section[data-testid="stSidebar"] {
             z-index: 1000 !important;
-        }}
-        header[data-testid="stHeader"] {{
+        }
+        header[data-testid="stHeader"] {
             z-index: 1001 !important;
-        }}
-        #pg-iframe-wrap {{
-            position: fixed;
-            top: 3.5rem;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            z-index: 1;
-            overflow: hidden;
-        }}
-        #pg-iframe-wrap iframe {{
-            width: 100%;
-            height: 100%;
-            border: none;
-            display: block;
-        }}
+        }
+        /* Make st.iframe stretch to fill available height */
+        div[data-testid="stIFrame"] {
+            flex: 1;
+            min-height: 0;
+        }
+        div[data-testid="stIFrame"] > div {
+            height: 100% !important;
+        }
+        div[data-testid="stIFrame"] iframe {
+            height: 100% !important;
+        }
         </style>
-        <div id="pg-iframe-wrap">
-            <iframe src="{ui_url}" id="pg-iframe-el"></iframe>
-        </div>
         """,
         unsafe_allow_html=True,
     )
-
-    # Inject JS via components.v1.html to adjust iframe position based on sidebar
-    st.components.v1.html(
-        """
-        <script>
-        (function() {
-            var wrap = parent.document.getElementById('pg-iframe-wrap');
-            var lastSidebarWidth = 0;
-
-            function getSidebar() {
-                return parent.document.querySelector('section[data-testid="stSidebar"]')
-                    || parent.document.querySelector('[data-testid="stSidebar"]');
-            }
-
-            function adjustLayout() {
-                if (!wrap) {
-                    wrap = parent.document.getElementById('pg-iframe-wrap');
-                }
-                if (!wrap) return;
-                wrap.style.height = (parent.window.innerHeight - 56) + 'px';
-                var sidebar = getSidebar();
-                if (sidebar) {
-                    var w = sidebar.getBoundingClientRect().width || sidebar.offsetWidth || 0;
-                    wrap.style.left = w + 'px';
-                    lastSidebarWidth = w;
-                }
-            }
-
-            adjustLayout();
-            parent.window.addEventListener('resize', adjustLayout);
-
-            setInterval(function() {
-                var sidebar = getSidebar();
-                if (sidebar) {
-                    var w = sidebar.getBoundingClientRect().width || sidebar.offsetWidth || 0;
-                    if (w !== lastSidebarWidth) {
-                        adjustLayout();
-                    }
-                }
-            }, 200);
-        })();
-        </script>
-        """,
-        height=0,
-    )
+    st.iframe(ui_url, width="stretch", height="stretch")
     return
 
     provider_to_key = _get_provider_to_key()
