@@ -179,8 +179,20 @@ def _upsert_message(session_uid: str, seq: int, role: str, content: str) -> int:
 
 def _delete_session(session_uid: str) -> None:
     with SessionLocal() as session:
-        session.query(PlaygroundChatMessage).filter(PlaygroundChatMessage.session_uid == session_uid).delete()
-        session.query(PlaygroundChatSession).filter(PlaygroundChatSession.session_uid == session_uid).delete()
+        messages = session.query(PlaygroundChatMessage).filter(
+            PlaygroundChatMessage.session_uid == session_uid
+        ).all()
+        message_ids = [msg.id for msg in messages]
+        if message_ids:
+            session.query(PlaygroundChatAttachment).filter(
+                PlaygroundChatAttachment.message_id.in_(message_ids)
+            ).delete(synchronize_session=False)
+        session.query(PlaygroundChatMessage).filter(
+            PlaygroundChatMessage.session_uid == session_uid
+        ).delete()
+        session.query(PlaygroundChatSession).filter(
+            PlaygroundChatSession.session_uid == session_uid
+        ).delete()
         session.commit()
 
 
@@ -254,7 +266,8 @@ def _build_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             att_data = _get_attachment_data(att.get("id"))
             if not att_data:
                 continue
-            if att_data.get("attachment_type") == "image":
+            att_type = att_data.get("attachment_type")
+            if att_type == "image":
                 b64 = _encode_image_to_base64(att_data["file_path"])
                 mime_type = att_data.get("mime_type") or "image/jpeg"
                 content_parts.append(
@@ -263,7 +276,15 @@ def _build_api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "image_url": {"url": f"data:{mime_type};base64,{b64}"},
                     }
                 )
-        payload_messages.append({"role": role, "content": content_parts or text_content})
+            else:
+                if text_content.strip():
+                    text_content += f"\n\n[附件: {att_data.get('filename')}]"
+                else:
+                    text_content = f"[附件: {att_data.get('filename')}]"
+        if content_parts:
+            payload_messages.append({"role": role, "content": content_parts})
+        else:
+            payload_messages.append({"role": role, "content": text_content or ""})
     return payload_messages
 
 
@@ -365,7 +386,10 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
             .all()
         )
         history: list[dict[str, Any]] = []
+        max_seq = -1
         for msg in messages:
+            if msg.seq > max_seq:
+                max_seq = msg.seq
             m: dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
             atts = (
                 session.query(PlaygroundChatAttachment)
@@ -376,18 +400,54 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
                 m["attachments"] = [{"id": a.attachment_uid} for a in atts]
             history.append(m)
 
-    user_msg: dict[str, Any] = {"role": "user", "content": prompt}
-    if attachment_ids:
-        user_msg["attachments"] = [{"id": i} for i in attachment_ids]
-    history.append(user_msg)
-    history.append({"role": "assistant", "content": ""})
-    title = _format_title(history)
-    _upsert_session({"id": session_id, "title": title, "provider": provider_name, "model": model_name})
-    user_idx = len(history) - 2
-    assistant_idx = len(history) - 1
-    user_message_id = _upsert_message(session_id, user_idx, "user", prompt)
-    if attachment_ids:
-        with SessionLocal() as session:
+        user_msg: dict[str, Any] = {"role": "user", "content": prompt}
+        if attachment_ids:
+            user_msg["attachments"] = [{"id": i} for i in attachment_ids]
+        history.append(user_msg)
+        history.append({"role": "assistant", "content": ""})
+        title = _format_title(history)
+        _upsert_session({"id": session_id, "title": title, "provider": provider_name, "model": model_name})
+        user_idx = max_seq + 1
+        assistant_idx = max_seq + 2
+        
+        user_db_msg = (
+            session.query(PlaygroundChatMessage)
+            .filter(
+                PlaygroundChatMessage.session_uid == session_id,
+                PlaygroundChatMessage.seq == user_idx,
+            )
+            .first()
+        )
+        if user_db_msg is None:
+            user_db_msg = PlaygroundChatMessage(
+                session_uid=session_id,
+                seq=user_idx,
+                role="user",
+                content=prompt or "",
+            )
+            session.add(user_db_msg)
+            session.flush()
+        else:
+            # 复用消息时，先清空旧的附件关联，防止幽灵附件残留
+            session.query(PlaygroundChatAttachment).filter(
+                PlaygroundChatAttachment.message_id == user_db_msg.id
+            ).update(
+                {PlaygroundChatAttachment.message_id: None, PlaygroundChatAttachment.session_uid: None},
+                synchronize_session=False
+            )
+            # 更新消息内容和角色
+            user_db_msg.role = "user"
+            user_db_msg.content = prompt or ""
+        
+        user_message_id = user_db_msg.id
+        
+        if attachment_ids:
+            session.query(PlaygroundChatAttachment).filter(
+                PlaygroundChatAttachment.message_id == user_message_id
+            ).update(
+                {PlaygroundChatAttachment.message_id: None, PlaygroundChatAttachment.session_uid: None},
+                synchronize_session=False
+            )
             for aid in attachment_ids:
                 db_attachment = (
                     session.query(PlaygroundChatAttachment)
@@ -397,8 +457,27 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
                 if db_attachment:
                     db_attachment.session_uid = session_id
                     db_attachment.message_id = user_message_id
-            session.commit()
-    _upsert_message(session_id, assistant_idx, "assistant", "")
+        
+        assistant_db_msg = (
+            session.query(PlaygroundChatMessage)
+            .filter(
+                PlaygroundChatMessage.session_uid == session_id,
+                PlaygroundChatMessage.seq == assistant_idx,
+            )
+            .first()
+        )
+        if assistant_db_msg is None:
+            assistant_db_msg = PlaygroundChatMessage(
+                session_uid=session_id,
+                seq=assistant_idx,
+                role="assistant",
+                content="",
+            )
+            session.add(assistant_db_msg)
+            session.flush()
+        
+        session.commit()
+        
     api_messages = _build_api_messages(history[:-1])
 
     async def event_gen():

@@ -246,8 +246,20 @@ def _upsert_message_to_db(session_uid: str, seq: int, role: str, content: str) -
 
 def _delete_session_from_db(session_uid: str) -> None:
     with SessionLocal() as session:
-        session.query(PlaygroundChatMessage).filter(PlaygroundChatMessage.session_uid == session_uid).delete()
-        session.query(PlaygroundChatSession).filter(PlaygroundChatSession.session_uid == session_uid).delete()
+        messages = session.query(PlaygroundChatMessage).filter(
+            PlaygroundChatMessage.session_uid == session_uid
+        ).all()
+        message_ids = [msg.id for msg in messages]
+        if message_ids:
+            session.query(PlaygroundChatAttachment).filter(
+                PlaygroundChatAttachment.message_id.in_(message_ids)
+            ).delete(synchronize_session=False)
+        session.query(PlaygroundChatMessage).filter(
+            PlaygroundChatMessage.session_uid == session_uid
+        ).delete()
+        session.query(PlaygroundChatSession).filter(
+            PlaygroundChatSession.session_uid == session_uid
+        ).delete()
         session.commit()
 
 
@@ -1220,15 +1232,15 @@ def _render_session_panel(
 
                 if pending_attachments:
                     user_message["attachments"] = [dict(a) for a in pending_attachments]
-                    for att in pending_attachments:
-                        with SessionLocal() as session:
+                    with SessionLocal() as session:
+                        for att in pending_attachments:
                             db_attachment = session.query(PlaygroundChatAttachment).filter(
                                 PlaygroundChatAttachment.attachment_uid == att.get("id")
                             ).first()
                             if db_attachment:
                                 db_attachment.session_uid = current_session_id
                                 db_attachment.message_id = user_message_id
-                                session.commit()
+                        session.commit()
 
                 _upsert_message_to_db(
                     session_uid=current_session_id,

@@ -34,6 +34,7 @@ function renderSessions() {
     el.className = `session-item ${sid === S.currentSessionId ? "active" : ""}`;
     el.onclick = () => {
       S.currentSessionId = sid;
+      S.pendingAttachments = [];
       renderAll();
     };
 
@@ -58,6 +59,7 @@ function renderSessions() {
         } else {
           await bootstrap();
         }
+        S.pendingAttachments = [];
       }
       renderAll();
     };
@@ -282,6 +284,7 @@ function bindEvents() {
     });
     S.sessions[data.session.id] = data.session;
     S.currentSessionId = data.session.id;
+    S.pendingAttachments = [];
     renderAll();
   };
 
