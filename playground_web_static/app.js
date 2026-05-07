@@ -491,6 +491,20 @@ function setBusy(busy) {
   }
 }
 
+function showToast(msg) {
+  const toast = document.createElement("div");
+  toast.className = "paste-toast";
+  toast.textContent = msg;
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => {
+    toast.classList.add("show");
+    setTimeout(() => {
+      toast.classList.remove("show");
+      setTimeout(() => toast.remove(), 300);
+    }, 2000);
+  });
+}
+
 function bindInputUX() {
   const prompt = $("promptInput");
   if (!prompt) return;
@@ -505,6 +519,55 @@ function bindInputUX() {
       await sendMessage();
     }
   });
+
+  // ── 剪贴板粘贴图片支持 ──
+  prompt.addEventListener("paste", async (e) => {
+    const clipboardData = e.clipboardData;
+    if (!clipboardData) return;
+
+    const items = clipboardData.items;
+    if (!items) return;
+
+    const imageItems = [];
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        imageItems.push(item);
+      }
+    }
+
+    if (imageItems.length === 0) return; // 没有图片，走默认粘贴文本逻辑
+
+    e.preventDefault();
+
+    // 如果剪贴板中同时有文本，手动插入到光标位置
+    const textContent = clipboardData.getData("text/plain");
+    if (textContent) {
+      const start = prompt.selectionStart;
+      const end = prompt.selectionEnd;
+      const before = prompt.value.substring(0, start);
+      const after = prompt.value.substring(end);
+      prompt.value = before + textContent + after;
+      prompt.selectionStart = prompt.selectionEnd = start + textContent.length;
+      prompt.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    // 将图片 blob 转为 File 对象并上传
+    const files = imageItems
+      .map((item) => {
+        const blob = item.getAsFile();
+        if (!blob) return null;
+        const ext = item.type.split("/")[1] || "png";
+        const name = `clipboard_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+        return new File([blob], name, { type: item.type });
+      })
+      .filter(Boolean);
+
+    if (files.length > 0) {
+      await uploadFiles(files);
+      showToast(`已粘贴 ${files.length} 张图片`);
+    }
+  });
+
   resize();
 }
 

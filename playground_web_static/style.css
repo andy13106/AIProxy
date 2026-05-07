@@ -840,6 +840,29 @@ body {
   box-shadow: none;
 }
 
+.paste-toast {
+  position: fixed;
+  bottom: 140px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent-bg-strong);
+  border: 1px solid var(--accent);
+  color: var(--accent-text);
+  padding: 8px 18px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  z-index: 9999;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.paste-toast.show {
+  opacity: 1;
+}
+
 @media (max-width: 768px) {
   .layout {
     flex-direction: column;
