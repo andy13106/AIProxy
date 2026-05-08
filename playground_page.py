@@ -1331,6 +1331,8 @@ def render_playground_page() -> None:
     st.markdown(
         """
         <style>
+        /* 用与通用主题同等的选择器优先级，确保覆盖主题的 max-width/padding-bottom */
+        [data-testid="stMain"] .block-container,
         .block-container {
             max-width: 100% !important;
             padding: 0 !important;

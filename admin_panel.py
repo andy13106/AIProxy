@@ -10,6 +10,7 @@ from model_mapping_page import render_model_mapping_page
 from tool_assistant_page import render_tool_assistant_page
 from playground_page import render_playground_page
 from system_settings_page import render_system_settings_page
+from streamlit_theme import apply_playground_theme
 
 
 if 'db_initialized' not in st.session_state:
@@ -17,6 +18,8 @@ if 'db_initialized' not in st.session_state:
     st.session_state.db_initialized = True
 
 st.set_page_config(page_title="AI Proxy Master Admin", layout="wide", initial_sidebar_state="expanded")
+
+apply_playground_theme()
 
 _admin_password = os.getenv("ADMIN_PASSWORD", "")
 _admin_host = (os.getenv("ADMIN_HOST", "0.0.0.0") or "").strip().lower()
@@ -40,17 +43,6 @@ if _admin_password:
             else:
                 st.error("密码错误")
         st.stop()
-
-st.markdown("""
-    <style>
-    .stButton>button {
-        width: 100%;
-        border-radius: 5px;
-    }
-    .status-active { color: #28a745; font-weight: bold; }
-    .status-inactive { color: #dc3545; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
 
 st.sidebar.title("🤖 AI-Proxy Admin")
 if st.sidebar.button("🔄 刷新页面", width="stretch"):
