@@ -2,9 +2,7 @@
 
 import base64
 import datetime
-import time
 import threading
-import os
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -12,62 +10,6 @@ import httpx
 import litellm
 from fastapi import HTTPException
 from sqlalchemy import select, update
-
-# 尝试导入 redis 用于多 worker 共享 round-robin cursor
-try:
-    import redis.asyncio as aioredis
-    _REDIS_AVAILABLE = True
-except ImportError:
-    _REDIS_AVAILABLE = False
-
-# === Circuit Breaker 配置 ===
-# provider 级别熔断：连续失败 N 次后跳过该 provider
-_CB_FAILURE_THRESHOLD = 5  # 连续失败次数阈值
-_CB_COOLDOWN_SEC = 60.0     # 熔断冷却时间（秒）
-_provider_cb_state = {}     # provider_id -> {"fail_count": int, "state": "closed"|"open", "opened_at": float}
-_cb_lock = threading.Lock()
-
-
-def _check_circuit_breaker(provider_id: int) -> bool:
-    """检查 provider 的 circuit breaker 状态。
-    返回 True 表示可以请求，False 表示已被熔断。
-    """
-    with _cb_lock:
-        state = _provider_cb_state.get(provider_id)
-        if not state or state["state"] == "closed":
-            return True
-
-        # 检查是否已过冷却期
-        elapsed = time.time() - state["opened_at"]
-        if elapsed >= _CB_COOLDOWN_SEC:
-            # 半开状态：允许一次请求尝试
-            state["state"] = "half-open"
-            state["fail_count"] = 0
-            return True
-
-        return False
-
-
-def _record_cb_success(provider_id: int) -> None:
-    """记录 provider 请求成功，关闭 circuit breaker"""
-    with _cb_lock:
-        if provider_id in _provider_cb_state:
-            _provider_cb_state[provider_id] = {"fail_count": 0, "state": "closed", "opened_at": 0}
-
-
-def _record_cb_failure(provider_id: int) -> None:
-    """记录 provider 请求失败，可能触发熔断"""
-    with _cb_lock:
-        state = _provider_cb_state.get(provider_id)
-        if not state:
-            state = {"fail_count": 0, "state": "closed", "opened_at": 0}
-            _provider_cb_state[provider_id] = state
-
-        state["fail_count"] += 1
-        if state["fail_count"] >= _CB_FAILURE_THRESHOLD and state["state"] == "closed":
-            state["state"] = "open"
-            state["opened_at"] = time.time()
-            logger.warning(f"Provider {provider_id} circuit breaker OPENED after {state['fail_count']} failures")
 
 from config import logger, settings
 from db import UsageLog
@@ -82,33 +24,13 @@ from converters import (
 from db import APIKey, AsyncSessionLocal, ModelMapping, Provider
 
 _provider_key_cursor_lock = threading.Lock()
-# Round-robin cursor: 多 worker 下使用 Redis 共享，单 worker 下使用本地 dict
 _provider_key_cursor = defaultdict(int)
-_redis_client = None
-_redis_lock = threading.Lock()
-
-# 事件循环中使用的 Redis 连接（每个事件循环一个）
-_async_redis = None
 
 
-def _get_async_redis():
-    """获取异步 Redis 客户端（事件循环内）"""
-    global _async_redis
-    if not _REDIS_AVAILABLE:
-        return None
-    if _async_redis is None:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        try:
-            _async_redis = aioredis.from_url(redis_url, decode_responses=True, max_connections=5)
-        except Exception:
-            _async_redis = None
-    return _async_redis
-
-
-async def _order_keys_for_provider(provider_id: int, keys: list) -> list:
+def _order_keys_for_provider(provider_id: int, keys: list) -> list:
     """根据策略返回 key 顺序：
     - sticky_failover: 固定顺序主 key 优先，失败再切换
-    - round_robin: 请求级轮询起点（多 worker 下通过 Redis 共享 cursor）
+    - round_robin: 请求级轮询起点
     """
     if not keys:
         return keys
@@ -117,26 +39,9 @@ async def _order_keys_for_provider(provider_id: int, keys: list) -> list:
         return ordered
     if settings.key_strategy != "round_robin":
         return ordered
-
-    # 尝试使用 Redis 共享 cursor（多 worker 场景）
-    redis_client = _get_async_redis()
-    if redis_client is not None:
-        cursor_key = f"aiproxy:rr:provider:{provider_id}"
-        try:
-            start_idx_val = await redis_client.get(cursor_key)
-            start_idx = int(start_idx_val) if start_idx_val else 0
-            new_idx = (start_idx + 1) % len(ordered)
-            await redis_client.set(cursor_key, str(new_idx))
-        except Exception:
-            # Redis 不可用时降级到本地 cursor
-            with _provider_key_cursor_lock:
-                start_idx = _provider_key_cursor[provider_id] % len(ordered)
-                _provider_key_cursor[provider_id] = (start_idx + 1) % len(ordered)
-    else:
-        with _provider_key_cursor_lock:
-            start_idx = _provider_key_cursor[provider_id] % len(ordered)
-            _provider_key_cursor[provider_id] = (start_idx + 1) % len(ordered)
-
+    with _provider_key_cursor_lock:
+        start_idx = _provider_key_cursor[provider_id] % len(ordered)
+        _provider_key_cursor[provider_id] = (start_idx + 1) % len(ordered)
     return ordered[start_idx:] + ordered[:start_idx]
 
 
@@ -231,7 +136,7 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
 
     cooldown_sec = max(0.0, settings.key_rate_limit_cooldown_sec)
     if cooldown_sec <= 0:
-        return await _order_keys_for_provider(provider_id, keys)
+        return _order_keys_for_provider(provider_id, keys)
 
     now = datetime.datetime.utcnow()
     eligible_keys = []
@@ -251,7 +156,7 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
                 earliest_available_in = remaining
 
     if eligible_keys:
-        return await _order_keys_for_provider(provider_id, eligible_keys)
+        return _order_keys_for_provider(provider_id, eligible_keys)
 
     retry_after = max(1, int(earliest_available_in or cooldown_sec))
     raise HTTPException(
@@ -287,7 +192,7 @@ def build_completion_params(
     api_key: APIKey,
     is_anthropic: bool,
     request_stream: bool,
-) -> tuple[dict, str, list, list]:
+) -> tuple[dict, str, list]:
     """构建 litellm 请求参数"""
     messages = body.get("messages") or []
     tools = body.get("tools") or []
@@ -389,8 +294,7 @@ def build_completion_params(
         if body.get("tool_choice") is not None:
             completion_kwargs["tool_choice"] = body.get("tool_choice")
 
-    # raw_messages 保留原始格式用于 token 计数
-    return completion_kwargs, clean_real_model, messages, list(messages)
+    return completion_kwargs, clean_real_model, messages
 
 
 async def log_usage(key_id: int, model_name: str, response_data: Any, is_image: bool = False) -> None:
@@ -441,15 +345,6 @@ async def execute_image_generation(body: dict) -> dict:
             raise HTTPException(status_code=404, detail=f"Image model {model_name} not mapped.")
 
         mapping, provider = mapping_data
-
-        # 检查 provider 级别 circuit breaker
-        if not _check_circuit_breaker(provider.id):
-            logger.warning(f"Provider {provider.id} ({provider.name}) is in circuit breaker OPEN state for image generation")
-            raise HTTPException(
-                status_code=503,
-                detail=f"Provider {provider.name} is temporarily unavailable. Please retry later."
-            )
-
         keys = await get_active_keys(session, provider.id)
 
         for api_key in keys:
@@ -474,7 +369,6 @@ async def execute_image_generation(body: dict) -> dict:
                 response = await litellm.aimage_generation(**img_kwargs)
                 await clear_key_failure(session, api_key.id)
                 await log_usage(api_key.id, model_name, response, is_image=True)
-                _record_cb_success(provider.id)
                 return response
             except Exception as e:
                 logger.error(f"Key {api_key.id} failed for image generation: {e}")
@@ -500,8 +394,6 @@ async def execute_image_generation(body: dict) -> dict:
                         await mark_key_rate_limited(session, api_key.id)
                     except Exception as mark_err:
                         logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
-                # 记录 provider 级别失败
-                _record_cb_failure(provider.id)
                 continue
 
         raise HTTPException(status_code=502, detail="All upstream keys failed for image generation.")
@@ -528,15 +420,6 @@ async def execute_nvidia_image_generation(body: dict) -> dict:
             raise HTTPException(status_code=404, detail=f"Image model {model_name} not mapped.")
 
         mapping, provider = mapping_data
-
-        # 检查 provider 级别 circuit breaker
-        if not _check_circuit_breaker(provider.id):
-            logger.warning(f"Provider {provider.id} ({provider.name}) is in circuit breaker OPEN state for image generation")
-            raise HTTPException(
-                status_code=503,
-                detail=f"Provider {provider.name} is temporarily unavailable. Please retry later."
-            )
-
         keys = await get_active_keys(session, provider.id)
 
         clean_api_base = clean_config_value(provider.api_base).rstrip("/")
@@ -603,7 +486,6 @@ async def execute_nvidia_image_generation(body: dict) -> dict:
                         b64 = base64.b64encode(resp.content).decode("utf-8")
 
                     await log_usage(api_key.id, model_name, {}, is_image=True)
-                    _record_cb_success(provider.id)
 
                     # 转换为 OpenAI 兼容格式返回
                     return {
@@ -631,8 +513,6 @@ async def execute_nvidia_image_generation(body: dict) -> dict:
                         await mark_key_rate_limited(session, api_key.id)
                     except Exception:
                         pass
-                # 记录 provider 级别失败
-                _record_cb_failure(provider.id)
                 continue
 
         raise HTTPException(status_code=502, detail="All upstream keys failed for NVIDIA image generation.")

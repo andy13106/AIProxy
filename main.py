@@ -93,29 +93,11 @@ def start_services() -> None:
     admin_port = int(os.getenv("ADMIN_PORT", "8501"))
 
     def _find_available_port(start_port: int, max_tries: int = 20) -> int | None:
-        """通过 bind() 测试端口可用性，支持 IPv4/IPv6 双栈"""
         for port in range(start_port, start_port + max_tries):
-            # 尝试 IPv4
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    sock.bind(("0.0.0.0", port))
-                    # 端口可用，立即释放
-                    pass
-            except OSError:
-                continue
-
-            # 如果 ADMIN_HOST 是 IPv6 地址，也测试 IPv6
-            admin_host = os.getenv("ADMIN_HOST", "0.0.0.0")
-            if admin_host in ("::", "::1", "0.0.0.0") or ":" in admin_host:
-                try:
-                    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
-                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        sock.bind(("::", port))
-                except OSError:
-                    continue
-
-            return port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if sock.connect_ex(("127.0.0.1", port)) != 0:
+                    return port
         return None
 
     selected_admin_port = _find_available_port(admin_port)

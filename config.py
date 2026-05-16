@@ -120,9 +120,5 @@ if settings.auth_enabled and not settings.master_key:
     print("[FATAL] MASTER_KEY 未设置，请在环境变量或 .env 文件中设置 MASTER_KEY")
     sys.exit(1)
 
-# 安全检查：MASTER_KEY 过短
-if settings.auth_enabled and len(settings.master_key) < 16:
-    print(f"[WARN] MASTER_KEY 过短（当前 {len(settings.master_key)} 字符），建议至少 16 个字符以提高安全性")
-
 # 全局日志实例
 logger = setup_logging(settings)

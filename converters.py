@@ -252,10 +252,8 @@ def normalize_tool_input(tool_name: str, tool_input: Any) -> dict:
             if candidate in normalized and normalized[candidate]:
                 normalized["command"] = normalized[candidate]
                 break
-        # 保留原始 commands 字段（某些工具期望数组格式）
         if "command" not in normalized and isinstance(normalized.get("commands"), list):
             normalized["command"] = "\n".join(str(x) for x in normalized["commands"] if x is not None)
-            # 同时保留原始 commands，不删除
 
     # Glob 工具常见参数兼容：统一补齐 pattern
     if "glob" in name:
