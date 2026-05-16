@@ -175,6 +175,19 @@ except Exception as e:
     import sys
     print(f"[WARN] SQLite schema migration failed (non-fatal): {e}", file=sys.stderr)
 
+# 检测并验证 WAL 模式
+try:
+    import sqlite3
+    _wal_conn = sqlite3.connect(DB_FILE_PATH)
+    _wal_result = _wal_conn.execute("PRAGMA journal_mode").fetchone()
+    _wal_mode = _wal_result[0] if _wal_result else "unknown"
+    _wal_conn.close()
+    if _wal_mode != "wal":
+        print(f"[WARN] SQLite journal_mode is '{_wal_mode}', expected 'wal'. "
+              f"WAL 模式对并发读写性能至关重要，请检查文件系统权限。")
+except Exception as e:
+    print(f"[WARN] 无法检测 SQLite journal_mode: {e}")
+
 from sqlalchemy.pool import NullPool
 
 # SQLite 异步连接 URL（绝对路径，避免不同启动目录导致连接到不同 DB 文件）
@@ -259,6 +272,18 @@ class ToolDefaultModel(Base):
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
 
+class PreviousResponse(Base):
+    """持久化存储 previous_response_id 上下文，避免内存溢出导致长对话链断裂"""
+    __tablename__ = "previous_responses"
+    id = Column(Integer, primary_key=True)
+    response_id = Column(String(64), unique=True, nullable=False, index=True)
+    input_items_json = Column(Text, nullable=False)  # JSON 存储 input items
+    output_items_json = Column(Text, nullable=False)  # JSON 存储 output items
+    body_json = Column(Text, nullable=False)  # 原始 body，用于重建响应
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)  # TTL，默认 24 小时
+
+
 class PlaygroundChatSession(Base):
     __tablename__ = "playground_chat_sessions"
     id = Column(Integer, primary_key=True)
@@ -303,3 +328,5 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
         # 启用 WAL 模式，提升并发读写性能
         await conn.execute(text("PRAGMA journal_mode=WAL"))
+        # 启用 TTL 自动清理（SQLite 需要手动触发）
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_previous_responses_expires ON previous_responses(expires_at)"))

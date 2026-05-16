@@ -1,5 +1,6 @@
 """AI Proxy Gateway - 主入口"""
 
+import datetime
 import json
 import time
 import uuid
@@ -11,7 +12,7 @@ import litellm
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from config import logger, request_id_ctx, settings
 from converters import (
@@ -22,7 +23,7 @@ from converters import (
     extract_text_from_content_blocks,
     mask_secret,
 )
-from db import AsyncSessionLocal, ModelMapping, init_db
+from db import AsyncSessionLocal, ModelMapping, PreviousResponse, init_db
 from services import (
     build_completion_params,
     clean_config_value,
@@ -33,6 +34,9 @@ from services import (
     get_model_mapping,
     log_usage,
     mark_key_rate_limited,
+    _check_circuit_breaker,
+    _record_cb_success,
+    _record_cb_failure,
 )
 from streaming import AnthropicToolStreamGenerator, StreamGenerator
 from playground_web_api import router as playground_web_router
@@ -51,8 +55,7 @@ security = HTTPBearer(auto_error=False)
 # --- 简易内存速率限制 ---
 _rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
 _rate_limit_last_cleanup: float = 0.0
-_responses_store: OrderedDict[str, dict[str, Any]] = OrderedDict()
-_RESPONSES_STORE_MAX = 200
+# previous_response_id 现在通过数据库持久化存储，不再使用内存 OrderedDict
 
 
 @app.middleware("http")
@@ -482,18 +485,32 @@ def _build_responses_context(body: dict[str, Any]) -> list[dict[str, Any]]:
     return list(previous.get("input") or []) + list(previous.get("output") or []) + current_input
 
 
-def _remember_response(response_payload: dict[str, Any], input_items: list[dict[str, Any]]) -> None:
+async def _remember_response(response_payload: dict[str, Any], input_items: list[dict[str, Any]], body: dict) -> None:
+    """将 previous_response 持久化到数据库"""
     response_id = response_payload.get("id")
     if not response_id:
         return
-    _responses_store[str(response_id)] = {
-        "response": response_payload,
-        "input": list(input_items),
-        "output": list(response_payload.get("output") or []),
-    }
-    _responses_store.move_to_end(str(response_id))
-    while len(_responses_store) > _RESPONSES_STORE_MAX:
-        _responses_store.popitem(last=False)
+
+    output_items = response_payload.get("output", [])
+    # 设置 TTL 为 24 小时
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+
+    async with AsyncSessionLocal() as session:
+        prev = PreviousResponse(
+            response_id=str(response_id),
+            input_items_json=json.dumps(input_items, ensure_ascii=False),
+            output_items_json=json.dumps(output_items, ensure_ascii=False),
+            body_json=json.dumps(body, ensure_ascii=False),
+            expires_at=expires_at,
+        )
+        session.add(prev)
+        await session.commit()
+
+        # 清理过期记录
+        await session.execute(
+            delete(PreviousResponse).where(PreviousResponse.expires_at < datetime.datetime.utcnow())
+        )
+        await session.commit()
 
 
 def _chat_response_to_responses(
@@ -853,7 +870,7 @@ async def responses_proxy(request: Request, auth=Depends(verify_auth)):
             yield "data: [DONE]\n\n"
 
             # 记住响应（用于 previous_response_id）
-            _remember_response(completed_payload, input_items)
+            await _remember_response(completed_payload, input_items, body)
 
         return StreamingResponse(
             _consume_and_convert(),
@@ -868,7 +885,7 @@ async def responses_proxy(request: Request, auth=Depends(verify_auth)):
     # 非流式请求：走原有逻辑
     chat_response = await handle_completion(chat_body, is_anthropic=False)
     responses_payload = _chat_response_to_responses(chat_response, body.get("model"), body=body, input_items=input_items)
-    _remember_response(responses_payload, input_items)
+    await _remember_response(responses_payload, input_items, body)
     return responses_payload
 
 
@@ -877,11 +894,34 @@ async def responses_proxy(request: Request, auth=Depends(verify_auth)):
 @app.get("/v1/v1/responses/{response_id}")
 @app.get("/api/v1/responses/{response_id}")
 async def get_response(response_id: str, auth=Depends(verify_auth)):
-    """查询本进程内生成过的 Responses 响应。"""
-    stored = _responses_store.get(response_id)
-    if not stored:
+    """查询 Responses 响应（从持久化存储）。"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(PreviousResponse).where(PreviousResponse.response_id == response_id)
+        )
+        row = result.scalar_one_or_none()
+
+    if not row:
         raise HTTPException(status_code=404, detail=f"Response {response_id} not found.")
-    return stored.get("response")
+
+    try:
+        body = json.loads(row.body_json)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Corrupted response data")
+
+    # 重建响应 payload
+    input_items = json.loads(row.input_items_json)
+    output_items = json.loads(row.output_items_json)
+
+    return {
+        "id": row.response_id,
+        "object": "response",
+        "created_at": int(row.created_at.timestamp()) if row.created_at else 0,
+        "status": "completed",
+        "input": input_items,
+        "output": output_items,
+        "model": body.get("model"),
+    }
 
 
 @app.get("/v1/responses/{response_id}/input_items")
@@ -889,13 +929,24 @@ async def get_response(response_id: str, auth=Depends(verify_auth)):
 @app.get("/v1/v1/responses/{response_id}/input_items")
 @app.get("/api/v1/responses/{response_id}/input_items")
 async def get_response_input_items(response_id: str, auth=Depends(verify_auth)):
-    """返回本进程内保存的 Responses 输入项，兼容客户端上下文探测。"""
-    stored = _responses_store.get(response_id)
-    if not stored:
+    """返回 Responses 输入项（从持久化存储）。"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(PreviousResponse).where(PreviousResponse.response_id == response_id)
+        )
+        row = result.scalar_one_or_none()
+
+    if not row:
         raise HTTPException(status_code=404, detail=f"Response {response_id} not found.")
+
+    try:
+        input_items = json.loads(row.input_items_json)
+    except Exception:
+        input_items = []
+
     return {
         "object": "list",
-        "data": stored.get("input") or [],
+        "data": input_items,
         "has_more": False,
         "first_id": None,
         "last_id": None,
@@ -995,6 +1046,14 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
         # 获取模型映射
         mapping, provider = await get_model_mapping(session, model_name, is_anthropic)
 
+        # 检查 provider 级别 circuit breaker
+        if not _check_circuit_breaker(provider.id):
+            logger.warning(f"Provider {provider.id} ({provider.name}) is in circuit breaker OPEN state, skipping")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Provider {provider.name} is temporarily unavailable due to repeated failures. Please retry later."
+            )
+
         # 获取活跃的 API Key
         keys = await get_active_keys(session, provider.id)
 
@@ -1017,7 +1076,7 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 if is_anthropic and tools:
                     request_stream = False
 
-                completion_kwargs, clean_real_model, messages = build_completion_params(
+                completion_kwargs, clean_real_model, messages, raw_messages = build_completion_params(
                     body=body,
                     mapping=mapping,
                     provider=provider,
@@ -1035,7 +1094,6 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 # 处理 Anthropic 工具调用的流式响应
                 if stream and is_anthropic and not request_stream:
                     response = await litellm.acompletion(**completion_kwargs)
-                    await clear_key_failure(session, api_key.id)
 
                     # 检查非流式响应大小，防止超大响应占满内存（50MB 上限）
                     try:
@@ -1054,7 +1112,9 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                         model_name=model_name,
                         clean_real_model=clean_real_model,
                         messages=messages,
+                        raw_messages=raw_messages,
                         key_id=api_key.id,
+                        session=session,  # 传入 session 用于 clear_key_failure
                         log_usage_callback=log_usage,
                         heartbeat_sec=settings.stream_heartbeat_sec,
                     )
@@ -1078,6 +1138,7 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                         model_name=model_name,
                         clean_real_model=clean_real_model,
                         messages=messages,
+                        raw_messages=raw_messages,
                         is_anthropic=is_anthropic,
                         key_id=api_key.id,
                         log_usage_callback=log_usage,
@@ -1095,6 +1156,9 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
 
                 # 记录使用量
                 await log_usage(api_key.id, model_name, response)
+
+                # 记录 provider 请求成功，关闭 circuit breaker
+                _record_cb_success(provider.id)
 
                 # 转换响应
                 if is_anthropic:
@@ -1131,6 +1195,8 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                         await mark_key_rate_limited(session, api_key.id)
                     except Exception as mark_err:
                         logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
+                # 记录 provider 级别失败，可能触发 circuit breaker
+                _record_cb_failure(provider.id)
                 continue
 
         if hit_total_timeout:

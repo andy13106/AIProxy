@@ -41,6 +41,7 @@ class StreamGenerator:
         model_name: str,
         clean_real_model: str,
         messages: list,
+        raw_messages: list,
         is_anthropic: bool,
         key_id: int,
         log_usage_callback: Callable,
@@ -49,7 +50,7 @@ class StreamGenerator:
         self.response = response
         self.model_name = model_name
         self.clean_real_model = clean_real_model
-        self.messages = messages
+        self.raw_messages = raw_messages
         self.is_anthropic = is_anthropic
         self.key_id = key_id
         self.log_usage_callback = log_usage_callback
@@ -168,7 +169,7 @@ class StreamGenerator:
     async def _finalize_usage(self) -> None:
         """完成 usage 统计"""
         if self.usage_totals["total_tokens"] == 0:
-            prompt_tokens = safe_token_count(self.clean_real_model, messages=self.messages)
+            prompt_tokens = safe_token_count(self.clean_real_model, messages=self.raw_messages)
             completion_tokens = safe_token_count(self.clean_real_model, text="".join(self.streamed_text_parts))
             self.usage_totals["prompt_tokens"] = prompt_tokens
             self.usage_totals["completion_tokens"] = completion_tokens
@@ -185,6 +186,7 @@ class AnthropicToolStreamGenerator:
         model_name: str,
         clean_real_model: str,
         messages: list,
+        raw_messages: list,
         key_id: int,
         log_usage_callback: Callable,
         heartbeat_sec: float = 15.0,
@@ -192,7 +194,7 @@ class AnthropicToolStreamGenerator:
         self.final_response = final_response
         self.model_name = model_name
         self.clean_real_model = clean_real_model
-        self.messages = messages
+        self.raw_messages = raw_messages
         self.key_id = key_id
         self.log_usage_callback = log_usage_callback
         self.heartbeat_sec = heartbeat_sec
@@ -293,11 +295,17 @@ class AnthropicToolStreamGenerator:
 
         finally:
             if self.usage_totals["total_tokens"] == 0:
-                prompt_tokens = safe_token_count(self.clean_real_model, messages=self.messages)
+                prompt_tokens = safe_token_count(self.clean_real_model, messages=self.raw_messages)
                 completion_tokens = safe_token_count(self.clean_real_model, text="".join(self.streamed_text_parts))
                 self.usage_totals["prompt_tokens"] = prompt_tokens
                 self.usage_totals["completion_tokens"] = completion_tokens
                 self.usage_totals["total_tokens"] = prompt_tokens + completion_tokens
+            # 无论成功还是失败，都清除 key 的失败状态（因为 upstream 响应已成功返回）
+            try:
+                from services import clear_key_failure
+                await clear_key_failure(self.session, self.key_id)
+            except Exception:
+                pass
             await self.log_usage_callback(self.key_id, self.model_name, {"usage": self.usage_totals})
 
 class ResponsesStreamGenerator:
@@ -311,6 +319,7 @@ class ResponsesStreamGenerator:
         model_name: str,
         clean_real_model: str,
         messages: list,
+        raw_messages: list,
         key_id: int,
         log_usage_callback: Callable,
         heartbeat_sec: float = 15.0,
@@ -320,7 +329,7 @@ class ResponsesStreamGenerator:
         self.input_items = input_items
         self.model_name = model_name
         self.clean_real_model = clean_real_model
-        self.messages = messages
+        self.raw_messages = raw_messages
         self.key_id = key_id
         self.log_usage_callback = log_usage_callback
         self.heartbeat_sec = heartbeat_sec
@@ -482,7 +491,7 @@ class ResponsesStreamGenerator:
 
         # 补全 usage（如果流中没有提供）
         if self.usage_totals["total_tokens"] == 0:
-            prompt_tokens = safe_token_count(self.clean_real_model, messages=self.messages)
+            prompt_tokens = safe_token_count(self.clean_real_model, messages=self.raw_messages)
             completion_tokens = safe_token_count(self.clean_real_model, text=full_text)
             self.usage_totals["prompt_tokens"] = prompt_tokens
             self.usage_totals["completion_tokens"] = completion_tokens
