@@ -76,6 +76,47 @@ async def get_model_mapping(session: Any, model_name: str, is_anthropic: bool) -
                     logger.warning(f"Model '{model_name}' not mapped. Fallback to '{fallback_name}'.")
                     break
 
+        if (
+            not mapping_data
+            and not is_anthropic
+            and isinstance(model_name, str)
+            and model_name.startswith(("gpt-", "o1", "o3", "o4", "codex-"))
+        ):
+            fallback_candidates = []
+            for candidate in [settings.default_fallback_virtual_model, "GLM5.1", "GLM5"]:
+                if candidate and candidate not in fallback_candidates:
+                    fallback_candidates.append(candidate)
+
+            for fallback_name in fallback_candidates:
+                fallback_stmt = (
+                    select(ModelMapping, Provider)
+                    .join(Provider)
+                    .where(ModelMapping.virtual_name == fallback_name)
+                )
+                fallback_result = await session.execute(fallback_stmt)
+                fallback_mapping_data = fallback_result.first()
+                if fallback_mapping_data:
+                    mapping_data = fallback_mapping_data
+                    logger.warning(f"Model '{model_name}' not mapped. Fallback to '{fallback_name}'.")
+                    break
+
+            if not mapping_data:
+                fallback_stmt = (
+                    select(ModelMapping, Provider)
+                    .join(Provider)
+                    .order_by(ModelMapping.order, ModelMapping.id)
+                    .limit(1)
+                )
+                fallback_result = await session.execute(fallback_stmt)
+                fallback_mapping_data = fallback_result.first()
+                if fallback_mapping_data:
+                    mapping_data = fallback_mapping_data
+                    fallback_mapping, _ = fallback_mapping_data
+                    logger.warning(
+                        f"Model '{model_name}' not mapped. Fallback to first mapped model "
+                        f"'{fallback_mapping.virtual_name}'."
+                    )
+
     if not mapping_data:
         logger.error(f"Model '{model_name}' not found in database")
         raise HTTPException(status_code=404, detail=f"Model {model_name} not mapped.")

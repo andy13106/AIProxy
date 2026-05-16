@@ -11,6 +11,7 @@ from config_assistant.injectors.claude_code import ClaudeCodeInjector
 from config_assistant.injectors.opencode import OpenCodeInjector
 from config_assistant.injectors.openclaw import OpenClawInjector
 from config_assistant.injectors.hermes import HermesInjector
+from config_assistant.injectors.codex import CodexInjector
 from config_assistant.ai_analyzer import AIAnalyzer
 
 
@@ -50,7 +51,27 @@ def render_tool_assistant_page():
         "opencode": "OpenCode",
         "openclaw": "OpenClaw",
         "hermes": "Hermes",
+        "codex": "Codex",
     }
+
+    def create_injector(tool_id: str, config_path: str):
+        injector_classes = {
+            "claude_code": ClaudeCodeInjector,
+            "opencode": OpenCodeInjector,
+            "openclaw": OpenClawInjector,
+            "hermes": HermesInjector,
+            "codex": CodexInjector,
+        }
+        injector_class = injector_classes.get(tool_id)
+        if not injector_class:
+            return None
+        return injector_class(
+            config_path=config_path,
+            proxy_base_url=base_host,
+            proxy_api_key=master_key,
+            model_list=model_list,
+            default_model=tool_model_config.get(tool_id, model_hint),
+        )
 
     running_in_docker = is_running_in_docker()
 
@@ -61,7 +82,7 @@ def render_tool_assistant_page():
         st.caption("为不同工具选择默认模型，例如 ClaudeCode/OpenCode 适合编程模型，OpenClaw/Hermes 适合对话模型。")
 
         tool_model_config = {}
-        tool_cols = st.columns(4)
+        tool_cols = st.columns(len(tool_display_names))
         for i, (tool_id, display_name) in enumerate(tool_display_names.items()):
             saved_default = tool_default_models.get(tool_id, model_hint)
             if saved_default not in model_list:
@@ -152,7 +173,7 @@ def render_tool_assistant_page():
                         col1.success("✅")
                         col2.write(f"**{result['display_name']}**")
                         col3.code(result["path"], language="text")
-                        default_checked = tool_id in ["claude_code", "opencode"]
+                        default_checked = tool_id in ["claude_code", "opencode", "codex"]
                         st.session_state.selected_tools[tool_id] = col4.checkbox(
                             "自动配置",
                             value=default_checked,
@@ -187,6 +208,8 @@ def render_tool_assistant_page():
                         tool_hints.append(f"OpenClaw (默认模型: {tool_model_config.get('openclaw', model_hint)})")
                     if st.session_state.selected_tools.get("hermes"):
                         tool_hints.append(f"Hermes (默认模型: {tool_model_config.get('hermes', model_hint)})")
+                    if st.session_state.selected_tools.get("codex"):
+                        tool_hints.append(f"Codex (默认模型: {tool_model_config.get('codex', model_hint)}, OpenAI Responses 协议)")
                     if tool_hints:
                         st.info("将为以下工具执行配置：\n- " + "\n- ".join(tool_hints))
                     
@@ -211,39 +234,7 @@ def render_tool_assistant_page():
                                 
                                 config_detector.ensure_config_dir(tool_id)
                                 
-                                injector = None
-                                if tool_id == "claude_code":
-                                    injector = ClaudeCodeInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
-                                elif tool_id == "opencode":
-                                    injector = OpenCodeInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
-                                elif tool_id == "openclaw":
-                                    injector = OpenClawInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
-                                elif tool_id == "hermes":
-                                    injector = HermesInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
+                                injector = create_injector(tool_id, config_path)
                                 
                                 if injector:
                                     ok, err = injector.inject()
@@ -290,39 +281,7 @@ def render_tool_assistant_page():
                                 result = st.session_state.scan_result[tool_id]
                                 config_path = result["path"] or config_detector.get_tool_config_path(tool_id)
                                 
-                                injector = None
-                                if tool_id == "claude_code":
-                                    injector = ClaudeCodeInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
-                                elif tool_id == "opencode":
-                                    injector = OpenCodeInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
-                                elif tool_id == "openclaw":
-                                    injector = OpenClawInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
-                                elif tool_id == "hermes":
-                                    injector = HermesInjector(
-                                        config_path=config_path,
-                                        proxy_base_url=base_host,
-                                        proxy_api_key=master_key,
-                                        model_list=model_list,
-                                        default_model=tool_model_config.get(tool_id, model_hint),
-                                    )
+                                injector = create_injector(tool_id, config_path)
                                 
                                 if injector:
                                     ok, err = injector.inject()
@@ -351,8 +310,9 @@ def render_tool_assistant_page():
                                     if hasattr(injector, "original_text") and hasattr(injector, "modified_text"):
                                         original_text = (getattr(injector, "original_text", "") or "").strip()
                                         modified_text = (getattr(injector, "modified_text", "") or "").strip()
-                                        col_orig.code(original_text or "(空)", language="yaml")
-                                        col_mod.code(modified_text or "(空)", language="yaml")
+                                        language = "toml" if str(config_path).endswith(".toml") else "yaml"
+                                        col_orig.code(original_text or "(空)", language=language)
+                                        col_mod.code(modified_text or "(空)", language=language)
                                     else:
                                         col_orig.json(injector.original_config)
                                         col_mod.json(injector.modified_config)
@@ -395,8 +355,29 @@ def render_tool_assistant_page():
                 "",
             ]
         )
+        codex_default_model = tool_default_models.get("codex", model_hint)
+        if codex_default_model not in model_list:
+            codex_default_model = model_hint
+        codex_config_content = "\n".join(
+            [
+                'model_provider = "aiproxy"',
+                f'model = "{codex_default_model}"',
+                "",
+                "[model_providers.aiproxy]",
+                'name = "AIProxy"',
+                f'base_url = "{proxy_url_v1}"',
+                'wire_api = "responses"',
+                "requires_openai_auth = true",
+                "",
+            ]
+        )
+        codex_auth_content = json.dumps(
+            {"OPENAI_API_KEY": master_key},
+            ensure_ascii=False,
+            indent=2,
+        )
 
-        t1, t2, t3, t4 = st.tabs(["Claude Code", "OpenCode", "Cursor / Trae", "Other Tools"])
+        t1, t2, t3, t4, t5 = st.tabs(["Claude Code", "OpenCode", "Codex", "Cursor / Trae", "Other Tools"])
     
         with t1:
             st.subheader("Claude Code 配置与启动")
@@ -519,6 +500,50 @@ def render_tool_assistant_page():
             st.caption("说明：OpenCode 这里应使用 OpenAI 兼容入口，所以 Base URL 需要带 `/v1`。")
 
         with t3:
+            st.subheader("Codex 配置指南")
+            selected_codex_model = st.selectbox(
+                "选择 Codex 默认模型",
+                options=model_list,
+                index=model_list.index(codex_default_model)
+                if codex_default_model in model_list
+                else 0,
+                key="codex_default_model_manual",
+            )
+            codex_config_content = "\n".join(
+                [
+                    'model_provider = "aiproxy"',
+                    f'model = "{selected_codex_model}"',
+                    "",
+                    "[model_providers.aiproxy]",
+                    'name = "AIProxy"',
+                    f'base_url = "{proxy_url_v1}"',
+                    'wire_api = "responses"',
+                    "requires_openai_auth = true",
+                    "",
+                ]
+            )
+            st.markdown(f"""
+            Codex 使用 `~/.codex/config.toml` 配置模型提供商，OpenAI 兼容入口需要带 `/v1`。
+            本地代理访问 Key 写在 `~/.codex/auth.json` 的 `OPENAI_API_KEY` 中。
+
+            **1. config.toml 示例**
+            """)
+            if st.button("生成 Codex 配置示例 (codex_config.toml)", key="codex_config_manual"):
+                with open("codex_config.toml", "w", encoding="utf-8") as f:
+                    f.write(codex_config_content)
+                st.success("配置示例已生成：`codex_config.toml`")
+            st.code(codex_config_content, language="toml")
+
+            st.markdown("**2. auth.json 示例**")
+            if st.button("生成 Codex 鉴权示例 (codex_auth.json)", key="codex_auth_manual"):
+                with open("codex_auth.json", "w", encoding="utf-8") as f:
+                    f.write(codex_auth_content + "\n")
+                st.success("鉴权示例已生成：`codex_auth.json`")
+            st.code(codex_auth_content, language="json")
+
+            st.caption("自动配置会写入当前服务端用户的 `~/.codex/config.toml`，并同步更新 `~/.codex/auth.json`。")
+
+        with t4:
             st.subheader("Cursor 配置指南")
             st.markdown(f"""
         Cursor 对接本代理时，建议按 **OpenAI 兼容接口** 的方式配置。
@@ -589,7 +614,7 @@ def render_tool_assistant_page():
                 language="text"
             )
 
-        with t4:
+        with t5:
             st.subheader("其他工具通用配置")
             st.markdown(f"""
             大部分兼容 OpenAI 协议的工具都适用以下参数：

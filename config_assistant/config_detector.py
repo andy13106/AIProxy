@@ -47,6 +47,15 @@ class ConfigDetector:
                 "$HOME/.hermes/config.yaml",
             ],
         },
+        "codex": {
+            "display_name": "Codex",
+            "filename": "config.toml",
+            "standard_paths": [
+                "~/.codex/config.toml",
+                "%USERPROFILE%/.codex/config.toml",
+                "$HOME/.codex/config.toml",
+            ],
+        },
     }
 
     def __init__(self):

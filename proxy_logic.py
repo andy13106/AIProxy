@@ -3,9 +3,9 @@
 import json
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import litellm
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
@@ -51,6 +51,8 @@ security = HTTPBearer(auto_error=False)
 # --- 简易内存速率限制 ---
 _rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
 _rate_limit_last_cleanup: float = 0.0
+_responses_store: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_RESPONSES_STORE_MAX = 200
 
 
 @app.middleware("http")
@@ -228,6 +230,676 @@ async def chat_proxy(request: Request, auth=Depends(verify_auth)):
     body = await request.json()
     logger.debug(f"/v1/chat/completions request - Model: {body.get('model')}, Stream: {body.get('stream', False)}")
     return await handle_completion(body, is_anthropic=False)
+
+
+def _responses_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for key in ("text", "input_text", "output_text", "refusal"):
+            if content.get(key) is not None:
+                return str(content.get(key))
+        return "" if content is None else json.dumps(content, ensure_ascii=False)
+    if not isinstance(content, list):
+        return "" if content is None else str(content)
+
+    text_parts = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict):
+            text = part.get("text")
+            if text is None:
+                text = part.get("input_text")
+            if text is None:
+                text = part.get("output_text")
+            if text is not None:
+                text_parts.append(str(text))
+    return "\n".join(p for p in text_parts if p)
+
+
+def _coerce_responses_input_items(input_data: Any) -> list[dict[str, Any]]:
+    if isinstance(input_data, str):
+        return [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": input_data}]}]
+    if isinstance(input_data, dict):
+        return [input_data]
+    if isinstance(input_data, list):
+        return [item for item in input_data if isinstance(item, dict)]
+    return []
+
+
+def _responses_instructions_to_messages(instructions: Any) -> list[dict[str, Any]]:
+    text = _responses_content_to_text(instructions)
+    if not text:
+        return []
+    return [{"role": "system", "content": text}]
+
+
+def _responses_input_to_messages(input_data: Any) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for item in _coerce_responses_input_items(input_data):
+
+        item_type = item.get("type")
+        if item_type == "message" or "role" in item:
+            role = item.get("role") or "user"
+            if role == "developer":
+                role = "system"
+            if role not in {"system", "user", "assistant", "tool"}:
+                role = "user"
+            messages.append({"role": role, "content": _responses_content_to_text(item.get("content"))})
+        elif item_type == "function_call_output":
+            tool_call_id = item.get("call_id") or item.get("id") or ""
+            if not tool_call_id:
+                continue
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": _responses_content_to_text(item.get("output")),
+                }
+            )
+        elif item_type == "function_call":
+            arguments = item.get("arguments") or "{}"
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name") or "tool",
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                }
+            )
+
+    return messages
+
+
+def _normalize_chat_messages_for_upstream(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    system_parts = []
+    pending_tool_call_ids: set[str] = set()
+    normalized = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role") or "user"
+        if role == "developer":
+            role = "system"
+
+        if role == "system":
+            text = _responses_content_to_text(message.get("content"))
+            if text:
+                system_parts.append(text)
+            continue
+
+        msg = dict(message)
+        msg["role"] = role if role in {"user", "assistant", "tool"} else "user"
+
+        if msg["role"] == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                clean_tool_calls = []
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function") or {}
+                    if not isinstance(function, dict):
+                        continue
+                    call_id = str(tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}")
+                    arguments = function.get("arguments") or "{}"
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    clean_tool_calls.append(
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": str(function.get("name") or "tool"),
+                                "arguments": arguments,
+                            },
+                        }
+                    )
+                    pending_tool_call_ids.add(call_id)
+                if clean_tool_calls:
+                    msg["tool_calls"] = clean_tool_calls
+                else:
+                    msg.pop("tool_calls", None)
+
+        if msg["role"] == "tool":
+            tool_call_id = str(msg.get("tool_call_id") or "")
+            content = _responses_content_to_text(msg.get("content"))
+            if not tool_call_id or tool_call_id not in pending_tool_call_ids:
+                msg = {
+                    "role": "user",
+                    "content": f"Tool result ({tool_call_id or 'unknown'}):\n{content}",
+                }
+            else:
+                msg["tool_call_id"] = tool_call_id
+                msg["content"] = content
+                pending_tool_call_ids.discard(tool_call_id)
+
+        if msg["role"] in {"user", "assistant"} and "content" in msg:
+            if msg.get("content") is not None:
+                msg["content"] = _responses_content_to_text(msg.get("content"))
+
+        normalized.append(msg)
+
+    if system_parts:
+        normalized.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+
+    return normalized
+
+
+def _responses_tool_choice_to_chat(tool_choice: Any) -> Any:
+    if tool_choice in (None, "", "auto", "required", "none"):
+        return "auto" if tool_choice == "required" else tool_choice
+    if not isinstance(tool_choice, dict):
+        return "auto"
+    if tool_choice.get("type") == "function" and tool_choice.get("name"):
+        return "auto"
+    if tool_choice.get("type") == "function" and isinstance(tool_choice.get("function"), dict):
+        return "auto"
+    if tool_choice.get("type") == "allowed_tools":
+        return "auto"
+    return "auto"
+
+
+def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:
+    if not isinstance(tools, list):
+        return []
+
+    chat_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") not in {"function", "custom"}:
+            continue
+        name = tool.get("name")
+        if not name:
+            continue
+        chat_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description") or "",
+                    "parameters": (
+                        tool.get("parameters")
+                        if isinstance(tool.get("parameters"), dict)
+                        else {"type": "object", "properties": {}}
+                    ),
+                },
+            }
+        )
+    return chat_tools
+
+
+def _responses_body_to_chat_body(body: dict[str, Any], input_items: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    if input_items is None:
+        input_items = _build_responses_context(body)
+    messages = _responses_instructions_to_messages(body.get("instructions"))
+    messages.extend(_responses_input_to_messages(input_items))
+    messages = _normalize_chat_messages_for_upstream(messages)
+
+    chat_body = {
+        "model": body.get("model"),
+        "messages": messages,
+        "stream": body.get("stream", False),
+        "temperature": body.get("temperature", 0.7),
+        "max_tokens": body.get("max_output_tokens") or body.get("max_tokens") or 4096,
+    }
+
+    tools = _responses_tools_to_chat_tools(body.get("tools"))
+    if tools:
+        chat_body["tools"] = tools
+        if body.get("tool_choice"):
+            chat_body["tool_choice"] = _responses_tool_choice_to_chat(body.get("tool_choice"))
+
+    return chat_body
+
+
+def _build_responses_context(body: dict[str, Any]) -> list[dict[str, Any]]:
+    current_input = _coerce_responses_input_items(body.get("input"))
+    if not current_input and isinstance(body.get("messages"), list):
+        current_input = _coerce_responses_input_items(body.get("messages"))
+    previous_response_id = body.get("previous_response_id")
+    if not previous_response_id:
+        return current_input
+
+    previous = _responses_store.get(str(previous_response_id))
+    if not previous:
+        logger.warning(f"previous_response_id not found in in-memory store: {previous_response_id}")
+        return current_input
+
+    return list(previous.get("input") or []) + list(previous.get("output") or []) + current_input
+
+
+def _remember_response(response_payload: dict[str, Any], input_items: list[dict[str, Any]]) -> None:
+    response_id = response_payload.get("id")
+    if not response_id:
+        return
+    _responses_store[str(response_id)] = {
+        "response": response_payload,
+        "input": list(input_items),
+        "output": list(response_payload.get("output") or []),
+    }
+    _responses_store.move_to_end(str(response_id))
+    while len(_responses_store) > _RESPONSES_STORE_MAX:
+        _responses_store.popitem(last=False)
+
+
+def _chat_response_to_responses(
+    response: Any,
+    model_name: str,
+    body: Optional[dict[str, Any]] = None,
+    input_items: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    body = body or {}
+    input_items = input_items or []
+    if hasattr(response, "model_dump"):
+        response_data = response.model_dump()
+    elif isinstance(response, dict):
+        response_data = response
+    else:
+        response_data = json.loads(json.dumps(response, default=str))
+
+    choice = (response_data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    response_id = f"resp_{uuid.uuid4().hex[:24]}"
+    output_items = []
+
+    content = _responses_content_to_text(message.get("content"))
+    if content:
+        output_items.append(
+            {
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content,
+                        "annotations": [],
+                    }
+                ],
+            }
+        )
+
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function") or {}
+        output_items.append(
+            {
+                "id": tool_call.get("id") or f"fc_{uuid.uuid4().hex[:24]}",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                "name": function.get("name") or "",
+                "arguments": function.get("arguments") or "{}",
+            }
+        )
+
+    usage = response_data.get("usage") or {}
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "error": None,
+        "incomplete_details": None,
+        "instructions": body.get("instructions"),
+        "max_output_tokens": body.get("max_output_tokens") or body.get("max_tokens"),
+        "model": model_name,
+        "input": input_items,
+        "output": output_items,
+        "output_text": content,
+        "parallel_tool_calls": body.get("parallel_tool_calls", True),
+        "previous_response_id": body.get("previous_response_id"),
+        "reasoning": body.get("reasoning") or {"effort": None, "summary": None},
+        "store": body.get("store", True),
+        "temperature": body.get("temperature", 0.7),
+        "text": body.get("text") or {"format": {"type": "text"}},
+        "tool_choice": body.get("tool_choice", "auto"),
+        "tools": body.get("tools", []),
+        "top_p": body.get("top_p", 1),
+        "truncation": body.get("truncation", "disabled"),
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+        "user": body.get("user"),
+        "metadata": body.get("metadata") or {},
+    }
+
+
+def _build_responses_response_payload(
+    response_id: str,
+    body: dict[str, Any],
+    input_items: list[dict[str, Any]],
+    status: str,
+    output: list[dict[str, Any]],
+    usage: dict[str, int],
+) -> dict[str, Any]:
+    """构建 Responses API 的 response payload。"""
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": status,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": body.get("instructions"),
+        "max_output_tokens": body.get("max_output_tokens") or body.get("max_tokens"),
+        "model": body.get("model"),
+        "input": input_items,
+        "output": output,
+        "output_text": "",
+        "parallel_tool_calls": body.get("parallel_tool_calls", True),
+        "previous_response_id": body.get("previous_response_id"),
+        "reasoning": body.get("reasoning") or {"effort": None, "summary": None},
+        "store": body.get("store", True),
+        "temperature": body.get("temperature", 0.7),
+        "text": body.get("text") or {"format": {"type": "text"}},
+        "tool_choice": body.get("tool_choice", "auto"),
+        "tools": body.get("tools", []),
+        "top_p": body.get("top_p", 1),
+        "truncation": body.get("truncation", "disabled"),
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+        "user": body.get("user"),
+        "metadata": body.get("metadata") or {},
+    }
+
+
+def _responses_sse(event_type: str, payload: dict[str, Any], sequence_number: int) -> str:
+    data = {"type": event_type, "sequence_number": sequence_number}
+    data.update(payload)
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _ensure_mapped_response_model(body: dict[str, Any]) -> None:
+    model_name = body.get("model")
+    if not model_name:
+        return
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ModelMapping.virtual_name)
+            .where(ModelMapping.virtual_name == model_name)
+            .limit(1)
+        )
+        if result.first():
+            return
+
+        fallback_result = await session.execute(
+            select(ModelMapping.virtual_name).order_by(ModelMapping.order, ModelMapping.id).limit(1)
+        )
+        fallback_row = fallback_result.first()
+
+    if fallback_row and fallback_row[0]:
+        fallback_model = fallback_row[0]
+        logger.warning(
+            f"Responses model '{model_name}' not mapped; fallback to proxy model '{fallback_model}'."
+        )
+        body["model"] = fallback_model
+
+
+@app.post("/v1/responses")
+@app.post("/responses")
+@app.post("/v1/v1/responses")
+@app.post("/api/v1/responses")
+async def responses_proxy(request: Request, auth=Depends(verify_auth)):
+    """OpenAI Responses 兼容接口，主要用于 Codex。"""
+    body = await request.json()
+    logger.debug(f"/v1/responses request - Model: {body.get('model')}, Stream: {body.get('stream', False)}")
+    body = dict(body)
+    await _ensure_mapped_response_model(body)
+
+    input_items = _build_responses_context(body)
+    chat_body = _responses_body_to_chat_body(body, input_items=input_items)
+
+    if body.get("stream"):
+        logger.info("Responses stream requested; using streaming upstream for real-time SSE.")
+        # 流式请求：上游也走 stream，实时转换 chat completion SSE 为 Responses API SSE
+        chat_body["stream"] = True
+        streaming_response = await handle_completion(chat_body, is_anthropic=False)
+
+        async def _consume_and_convert():
+            """消费 chat completion SSE 流，实时转换为 Responses API SSE 事件。"""
+            response_id = f"resp_{uuid.uuid4().hex[:24]}"
+            message_id = f"msg_{uuid.uuid4().hex[:24]}"
+            seq = 0
+            text_parts: list[str] = []
+            tool_calls: dict[int, dict[str, Any]] = {}
+            usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            finish_reason = None
+
+            def next_seq():
+                nonlocal seq
+                seq += 1
+                return seq
+
+            def sse(event_type: str, payload: dict[str, Any]) -> str:
+                data = {"type": event_type, "sequence_number": next_seq()}
+                data.update(payload)
+                return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+            # response.created
+            created_payload = _build_responses_response_payload(
+                response_id, body, input_items, status="in_progress", output=[], usage=usage_totals
+            )
+            yield sse("response.created", {"response": created_payload})
+
+            # output_item.added (message)
+            msg_item = {
+                "id": message_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            }
+            yield sse("response.output_item.added", {"output_index": 0, "item": msg_item})
+
+            # content_part.added
+            content_part = {"type": "output_text", "text": "", "annotations": []}
+            yield sse(
+                "response.content_part.added",
+                {"item_id": message_id, "output_index": 0, "content_index": 0, "part": content_part},
+            )
+
+            text_started = False
+            # 消费上游 chat completion SSE
+            body_iterator = streaming_response.body_iterator
+            try:
+                async for raw_chunk in body_iterator:
+                    if not raw_chunk or not raw_chunk.strip():
+                        continue
+                    # 跳过 SSE 注释行（心跳）
+                    if raw_chunk.startswith(":"):
+                        yield raw_chunk + "\n\n" if not raw_chunk.endswith("\n\n") else raw_chunk
+                        continue
+                    # 跳过 [DONE]
+                    if raw_chunk.strip() == "data: [DONE]":
+                        continue
+                    # 解析 data: 行
+                    line = raw_chunk.strip()
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    try:
+                        chunk_data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # 提取 usage
+                    chunk_usage = chunk_data.get("usage") or {}
+                    if chunk_usage.get("prompt_tokens"):
+                        usage_totals["prompt_tokens"] = chunk_usage["prompt_tokens"]
+                    if chunk_usage.get("completion_tokens"):
+                        usage_totals["completion_tokens"] = chunk_usage["completion_tokens"]
+                    if chunk_usage.get("total_tokens"):
+                        usage_totals["total_tokens"] = chunk_usage["total_tokens"]
+                    # 提取 delta
+                    choices = chunk_data.get("choices") or [{}]
+                    choice = choices[0]
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = choice.get("delta") or {}
+                    # 文本增量
+                    content = delta.get("content")
+                    if content:
+                        text_started = True
+                        text_parts.append(content)
+                        yield sse(
+                            "response.output_text.delta",
+                            {
+                                "item_id": message_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": content,
+                            },
+                        )
+                    # tool call 增量
+                    for tc_delta in delta.get("tool_calls") or []:
+                        tc_index = tc_delta.get("index", 0)
+                        if tc_index not in tool_calls:
+                            tool_calls[tc_index] = {
+                                "id": tc_delta.get("id") or f"fc_{uuid.uuid4().hex[:24]}",
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": tc_delta.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        tc = tool_calls[tc_index]
+                        fn_delta = tc_delta.get("function") or {}
+                        if fn_delta.get("name"):
+                            tc["name"] = fn_delta["name"]
+                        if fn_delta.get("arguments"):
+                            tc["arguments"] += fn_delta["arguments"]
+            except Exception as e:
+                logger.error(f"Responses stream conversion error: {type(e).__name__}: {e}")
+
+            # 发送 text done
+            full_text = "".join(text_parts)
+            yield sse(
+                "response.output_text.done",
+                {"item_id": message_id, "output_index": 0, "content_index": 0, "text": full_text},
+            )
+            # content_part.done
+            content_part_done = {"type": "output_text", "text": full_text, "annotations": []}
+            yield sse(
+                "response.content_part.done",
+                {"item_id": message_id, "output_index": 0, "content_index": 0, "part": content_part_done},
+            )
+            # output_item.done (message)
+            msg_item_done = {
+                "id": message_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+            }
+            yield sse("response.output_item.done", {"output_index": 0, "item": msg_item_done})
+
+            # tool call items
+            for tc_index in sorted(tool_calls.keys()):
+                tc = tool_calls[tc_index]
+                output_index = 1 + tc_index
+                tc["status"] = "completed"
+                yield sse("response.output_item.added", {"output_index": output_index, "item": tc})
+                yield sse(
+                    "response.function_call_arguments.delta",
+                    {
+                        "item_id": tc["id"],
+                        "call_id": tc.get("call_id"),
+                        "output_index": output_index,
+                        "delta": tc.get("arguments") or "",
+                    },
+                )
+                yield sse(
+                    "response.function_call_arguments.done",
+                    {
+                        "item_id": tc["id"],
+                        "call_id": tc.get("call_id"),
+                        "name": tc.get("name"),
+                        "output_index": output_index,
+                        "arguments": tc.get("arguments") or "{}",
+                    },
+                )
+                yield sse("response.output_item.done", {"output_index": output_index, "item": tc})
+
+            # 构建 output items
+            output_items = []
+            if full_text:
+                output_items.append(msg_item_done)
+            for tc_index in sorted(tool_calls.keys()):
+                output_items.append(tool_calls[tc_index])
+
+            # response.completed
+            completed_payload = _build_responses_response_payload(
+                response_id, body, input_items, status="completed", output=output_items, usage=usage_totals
+            )
+            yield sse("response.completed", {"response": completed_payload})
+            yield "data: [DONE]\n\n"
+
+            # 记住响应（用于 previous_response_id）
+            _remember_response(completed_payload, input_items)
+
+        return StreamingResponse(
+            _consume_and_convert(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # 非流式请求：走原有逻辑
+    chat_response = await handle_completion(chat_body, is_anthropic=False)
+    responses_payload = _chat_response_to_responses(chat_response, body.get("model"), body=body, input_items=input_items)
+    _remember_response(responses_payload, input_items)
+    return responses_payload
+
+
+@app.get("/v1/responses/{response_id}")
+@app.get("/responses/{response_id}")
+@app.get("/v1/v1/responses/{response_id}")
+@app.get("/api/v1/responses/{response_id}")
+async def get_response(response_id: str, auth=Depends(verify_auth)):
+    """查询本进程内生成过的 Responses 响应。"""
+    stored = _responses_store.get(response_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail=f"Response {response_id} not found.")
+    return stored.get("response")
+
+
+@app.get("/v1/responses/{response_id}/input_items")
+@app.get("/responses/{response_id}/input_items")
+@app.get("/v1/v1/responses/{response_id}/input_items")
+@app.get("/api/v1/responses/{response_id}/input_items")
+async def get_response_input_items(response_id: str, auth=Depends(verify_auth)):
+    """返回本进程内保存的 Responses 输入项，兼容客户端上下文探测。"""
+    stored = _responses_store.get(response_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail=f"Response {response_id} not found.")
+    return {
+        "object": "list",
+        "data": stored.get("input") or [],
+        "has_more": False,
+        "first_id": None,
+        "last_id": None,
+    }
 
 
 @app.post("/v1/messages/count_tokens")
