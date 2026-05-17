@@ -1,10 +1,10 @@
 """流式响应处理模块"""
 
 import asyncio
-import time
 import json
+import time
 import uuid
-from typing import Any, AsyncGenerator, Callable, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
 
 from config import logger, settings
 from converters import (
@@ -21,15 +21,25 @@ from converters import (
 async def iter_stream_with_heartbeat(response: Any, heartbeat_sec: float) -> AsyncGenerator[Any, None]:
     """带心跳的流式迭代器"""
     iterator = response.__aiter__()
-    while True:
-        try:
-            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=heartbeat_sec)
+    pending_next = asyncio.create_task(iterator.__anext__())
+    timeout = max(1.0, float(heartbeat_sec))
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending_next}, timeout=timeout)
+            if not done:
+                # SSE 注释行作为心跳，避免中间层空闲超时断开连接
+                yield None
+                continue
+
+            try:
+                chunk = pending_next.result()
+            except StopAsyncIteration:
+                break
+            pending_next = asyncio.create_task(iterator.__anext__())
             yield chunk
-        except asyncio.TimeoutError:
-            # SSE 注释行作为心跳，避免中间层空闲超时断开连接
-            yield None
-        except StopAsyncIteration:
-            break
+    finally:
+        if not pending_next.done():
+            pending_next.cancel()
 
 
 class StreamGenerator:
@@ -44,6 +54,7 @@ class StreamGenerator:
         is_anthropic: bool,
         key_id: int,
         log_usage_callback: Callable,
+        stream_error_callback: Optional[Callable[[int, Exception], Awaitable[None]]] = None,
         heartbeat_sec: float = 15.0,
     ):
         self.response = response
@@ -53,6 +64,7 @@ class StreamGenerator:
         self.is_anthropic = is_anthropic
         self.key_id = key_id
         self.log_usage_callback = log_usage_callback
+        self.stream_error_callback = stream_error_callback
         self.heartbeat_sec = heartbeat_sec
 
         self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -132,13 +144,20 @@ class StreamGenerator:
         except (asyncio.CancelledError, ConnectionError, Exception) as e:
             if not isinstance(e, asyncio.CancelledError):
                 logger.error(f"流式响应中断: {type(e).__name__}: {e}")
+                if self.stream_error_callback is not None:
+                    try:
+                        await self.stream_error_callback(self.key_id, e)
+                    except Exception as callback_error:
+                        logger.warning(f"流式错误冷却 key 失败: {callback_error}")
             if self.is_anthropic:
                 yield sse_event("error", {"type": "error", "error": {"type": "stream_error", "message": str(e)}})
             else:
                 yield f"data: {{\"error\": {{\"message\": \"流式响应中断: {type(e).__name__}\", \"type\": \"stream_error\"}}}}\n\n"
-        finally:
+            # 中断时不发送正常的 stop/done 事件，让客户端知道这是异常终止
             await self._finalize_usage()
+            return
 
+        # 正常完成：发送结束事件
         if self.is_anthropic:
             if not text_block_started:
                 yield sse_event(
@@ -164,6 +183,8 @@ class StreamGenerator:
             yield sse_event("message_stop", {"type": "message_stop"})
         else:
             yield "data: [DONE]\n\n"
+
+        await self._finalize_usage()
 
     async def _finalize_usage(self) -> None:
         """完成 usage 统计"""
@@ -365,7 +386,6 @@ class ResponsesStreamGenerator:
 
         text_started = False
         final_finish_reason = None
-
         try:
             async for maybe_chunk in iter_stream_with_heartbeat(self.response, self.heartbeat_sec):
                 if maybe_chunk is None:
@@ -423,6 +443,17 @@ class ResponsesStreamGenerator:
         except (asyncio.CancelledError, ConnectionError, Exception) as e:
             if not isinstance(e, asyncio.CancelledError):
                 logger.error(f"Responses流式响应中断: {type(e).__name__}: {e}")
+            # 发送错误事件并立即终止，避免发送不完整数据
+            yield self._sse("error", {
+                "type": "error",
+                "error": {
+                    "type": "stream_error",
+                    "message": f"流式响应中断: {type(e).__name__}: {str(e)}",
+                },
+            })
+            yield "data: [DONE]\n\n"
+            await self._finalize_usage()
+            return
 
         # 发送 text done
         full_text = "".join(self.streamed_text_parts)

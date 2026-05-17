@@ -2,6 +2,7 @@
 
 import base64
 import datetime
+import email.utils
 import threading
 from collections import defaultdict
 from typing import Any, Optional
@@ -43,6 +44,77 @@ def _order_keys_for_provider(provider_id: int, keys: list) -> list:
         start_idx = _provider_key_cursor[provider_id] % len(ordered)
         _provider_key_cursor[provider_id] = (start_idx + 1) % len(ordered)
     return ordered[start_idx:] + ordered[:start_idx]
+
+
+def extract_retry_after_seconds_from_headers(headers: Any, default: Optional[int] = None) -> Optional[int]:
+    """从 HTTP headers 里解析 Retry-After 秒数。"""
+    value = None
+    if headers:
+        try:
+            value = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            value = None
+
+    if value is None:
+        return default
+
+    try:
+        return max(1, int(float(value)))
+    except (TypeError, ValueError):
+        try:
+            retry_at = email.utils.parsedate_to_datetime(str(value))
+            now = datetime.datetime.now(retry_at.tzinfo or datetime.timezone.utc)
+            return max(1, int((retry_at - now).total_seconds()))
+        except Exception:
+            return default
+
+
+def extract_retry_after_seconds(error: Exception, default: Optional[int] = None) -> Optional[int]:
+    """从上游异常里尽量提取 Retry-After 秒数。"""
+    headers = getattr(error, "headers", None)
+    if not headers and hasattr(error, "response"):
+        headers = getattr(getattr(error, "response", None), "headers", None)
+    if not headers and hasattr(error, "llm_provider_response"):
+        headers = getattr(getattr(error, "llm_provider_response", None), "headers", None)
+    return extract_retry_after_seconds_from_headers(headers, default=default)
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    """判断异常是否为上游限流。"""
+    status_code = getattr(error, "status_code", None)
+    if status_code == 429:
+        return True
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) == 429:
+        return True
+    error_text = str(error).lower()
+    return (
+        "ratelimiterror" in error_text
+        or "rate limit" in error_text
+        or "too many requests" in error_text
+        or "error code: 429" in error_text
+        or "'status': 429" in error_text
+        or "status_code: 429" in error_text
+    )
+
+
+def is_transient_network_error(error_text: str) -> bool:
+    """判断错误文本是否属于短暂网络/上游连接问题。"""
+    return any(
+        token in error_text
+        for token in [
+            "connection error",
+            "server disconnected",
+            "readerror",
+            "read timeout",
+            "timed out",
+            "sockettimeouterror",
+            "apitimeouterror",
+            "remoteprotocolerror",
+            "connection reset",
+            "connection aborted",
+        ]
+    )
 
 
 async def get_model_mapping(session: Any, model_name: str, is_anthropic: bool) -> tuple:
@@ -147,8 +219,9 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
             eligible_keys.append(key)
             continue
 
+        key_cooldown_sec = getattr(key, "retry_after_seconds", None) or cooldown_sec
         elapsed = (now - key.last_failure).total_seconds()
-        remaining = cooldown_sec - elapsed
+        remaining = max(0.0, float(key_cooldown_sec)) - elapsed
         if remaining <= 0:
             eligible_keys.append(key)
         else:
@@ -166,17 +239,31 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
     )
 
 
-async def mark_key_rate_limited(session: Any, key_id: int) -> None:
-    """标记 key 进入限流冷却"""
+async def mark_key_rate_limited(session: Any, key_id: int, retry_after: Optional[int] = None) -> None:
+    """标记 key 进入限流冷却
+    
+    Args:
+        retry_after: 上游返回的 Retry-After 秒数，如果为 None 则使用配置的冷却时间
+    """
+    if retry_after is None:
+        cooldown_sec = int(settings.key_rate_limit_cooldown_sec)
+    else:
+        cooldown_sec = max(1, int(retry_after))
+
     await session.execute(
-        update(APIKey).where(APIKey.id == key_id).values(last_failure=datetime.datetime.utcnow())
+        update(APIKey).where(APIKey.id == key_id).values(
+            last_failure=datetime.datetime.utcnow(),
+            retry_after_seconds=cooldown_sec,
+        )
     )
     await session.commit()
 
 
 async def clear_key_failure(session: Any, key_id: int) -> None:
     """请求成功后清除 key 失败状态"""
-    await session.execute(update(APIKey).where(APIKey.id == key_id).values(last_failure=None))
+    await session.execute(
+        update(APIKey).where(APIKey.id == key_id).values(last_failure=None, retry_after_seconds=None)
+    )
     await session.commit()
 
 
@@ -373,25 +460,17 @@ async def execute_image_generation(body: dict) -> dict:
             except Exception as e:
                 logger.error(f"Key {api_key.id} failed for image generation: {e}")
                 error_text = str(e).lower()
-                if "ratelimiterror" in error_text or "error code: 429" in error_text or "'status': 429" in error_text:
+                if is_rate_limit_error(e):
                     try:
-                        await mark_key_rate_limited(session, api_key.id)
+                        retry_after = extract_retry_after_seconds(
+                            e, default=int(settings.key_rate_limit_cooldown_sec)
+                        )
+                        await mark_key_rate_limited(session, api_key.id, retry_after=retry_after)
                     except Exception as mark_err:
                         logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
-                elif any(
-                    token in error_text
-                    for token in [
-                        "connection error",
-                        "server disconnected",
-                        "readerror",
-                        "read timeout",
-                        "timed out",
-                        "sockettimeouterror",
-                        "apitimeouterror",
-                    ]
-                ):
+                elif is_transient_network_error(error_text):
                     try:
-                        await mark_key_rate_limited(session, api_key.id)
+                        await mark_key_rate_limited(session, api_key.id, retry_after=30)
                     except Exception as mark_err:
                         logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
                 continue
@@ -499,7 +578,8 @@ async def execute_nvidia_image_generation(body: dict) -> dict:
 
                 if resp.status_code == 429:
                     try:
-                        await mark_key_rate_limited(session, api_key.id)
+                        retry_after = extract_retry_after_seconds_from_headers(resp.headers)
+                        await mark_key_rate_limited(session, api_key.id, retry_after=retry_after)
                     except Exception as mark_err:
                         logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
                 elif resp.status_code in (401, 403):
@@ -510,7 +590,7 @@ async def execute_nvidia_image_generation(body: dict) -> dict:
                 error_text = str(e).lower()
                 if any(t in error_text for t in ("timeout", "timed out", "connection")):
                     try:
-                        await mark_key_rate_limited(session, api_key.id)
+                        await mark_key_rate_limited(session, api_key.id, retry_after=30)
                     except Exception:
                         pass
                 continue

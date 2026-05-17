@@ -29,8 +29,11 @@ from services import (
     clear_key_failure,
     execute_image_generation,
     execute_nvidia_image_generation,
+    extract_retry_after_seconds,
     get_active_keys,
     get_model_mapping,
+    is_rate_limit_error,
+    is_transient_network_error,
     log_usage,
     mark_key_rate_limited,
 )
@@ -720,18 +723,23 @@ async def responses_proxy(request: Request, auth=Depends(verify_auth)):
             )
 
             text_started = False
+            stream_error = None  # 记录流式过程中发生的错误
+            received_done = False  # 标记是否收到了真正的 [DONE] 信号
             # 消费上游 chat completion SSE
             body_iterator = streaming_response.body_iterator
             try:
                 async for raw_chunk in body_iterator:
+                    if isinstance(raw_chunk, bytes):
+                        raw_chunk = raw_chunk.decode("utf-8", errors="replace")
                     if not raw_chunk or not raw_chunk.strip():
                         continue
                     # 跳过 SSE 注释行（心跳）
                     if raw_chunk.startswith(":"):
                         yield raw_chunk + "\n\n" if not raw_chunk.endswith("\n\n") else raw_chunk
                         continue
-                    # 跳过 [DONE]
+                    # 检测真正的 [DONE] 信号
                     if raw_chunk.strip() == "data: [DONE]":
+                        received_done = True
                         continue
                     # 解析 data: 行
                     line = raw_chunk.strip()
@@ -787,9 +795,38 @@ async def responses_proxy(request: Request, auth=Depends(verify_auth)):
                         if fn_delta.get("arguments"):
                             tc["arguments"] += fn_delta["arguments"]
             except Exception as e:
+                stream_error = e
                 logger.error(f"Responses stream conversion error: {type(e).__name__}: {e}")
 
-            # 发送 text done
+            # 判断退出原因
+            if stream_error is not None:
+                # 上游异常中断
+                yield sse("error", {
+                    "type": "error",
+                    "error": {
+                        "type": "stream_error",
+                        "message": f"流式响应中断: {type(stream_error).__name__}: {str(stream_error)}",
+                    },
+                })
+                yield "data: [DONE]\n\n"
+                return
+
+            if not received_done:
+                # 迭代器退出但没有收到 [DONE]，说明上游提前断开（非正常完成）
+                logger.warning(f"Responses stream ended without [DONE], text={len(text_parts)} chunks, "
+                              f"tool_calls={len(tool_calls)}, text_started={text_started}")
+                # 如果已经有一些文本或工具调用，可能是上游超时或连接断开
+                yield sse("error", {
+                    "type": "error",
+                    "error": {
+                        "type": "stream_error",
+                        "message": "流式响应提前中断，上游连接关闭。",
+                    },
+                })
+                yield "data: [DONE]\n\n"
+                return
+
+            # 正常完成：收到 [DONE] 信号，发送结束事件
             full_text = "".join(text_parts)
             yield sse(
                 "response.output_text.done",
@@ -991,6 +1028,17 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
         f"per_key_timeout={per_key_timeout}, total_timeout={total_timeout}"
     )
 
+    async def cool_down_stream_failed_key(key_id: int, error: Exception) -> None:
+        error_text = str(error).lower()
+        async with AsyncSessionLocal() as callback_session:
+            if is_rate_limit_error(error):
+                retry_after = extract_retry_after_seconds(
+                    error, default=int(settings.key_rate_limit_cooldown_sec)
+                )
+                await mark_key_rate_limited(callback_session, key_id, retry_after=retry_after)
+            elif is_transient_network_error(error_text):
+                await mark_key_rate_limited(callback_session, key_id, retry_after=30)
+
     async with AsyncSessionLocal() as session:
         # 获取模型映射
         mapping, provider = await get_model_mapping(session, model_name, is_anthropic)
@@ -1081,6 +1129,7 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                         is_anthropic=is_anthropic,
                         key_id=api_key.id,
                         log_usage_callback=log_usage,
+                        stream_error_callback=cool_down_stream_failed_key,
                         heartbeat_sec=settings.stream_heartbeat_sec,
                     )
                     return StreamingResponse(
@@ -1108,27 +1157,19 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 logger.error(f"Key {api_key.id} failed: {e}")
                 last_error = str(e)
                 error_text = str(e).lower()
-                if "ratelimiterror" in error_text or "error code: 429" in error_text or "'status': 429" in error_text:
+                if is_rate_limit_error(e):
                     had_rate_limit_error = True
                     try:
-                        await mark_key_rate_limited(session, api_key.id)
+                        retry_after = extract_retry_after_seconds(
+                            e, default=int(settings.key_rate_limit_cooldown_sec)
+                        )
+                        await mark_key_rate_limited(session, api_key.id, retry_after=retry_after)
                     except Exception as mark_err:
                         logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
-                elif any(
-                    token in error_text
-                    for token in [
-                        "connection error",
-                        "server disconnected",
-                        "readerror",
-                        "read timeout",
-                        "timed out",
-                        "sockettimeouterror",
-                        "apitimeouterror",
-                    ]
-                ):
+                elif is_transient_network_error(error_text):
                     had_transient_network_error = True
                     try:
-                        await mark_key_rate_limited(session, api_key.id)
+                        await mark_key_rate_limited(session, api_key.id, retry_after=30)
                     except Exception as mark_err:
                         logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
                 continue

@@ -164,6 +164,14 @@ def ensure_sqlite_schema() -> None:
             "CREATE INDEX IF NOT EXISTS ix_playground_chat_attachments_session_uid "
             "ON playground_chat_attachments(session_uid)"
         )
+
+        # api_keys.retry_after_seconds 列
+        # SQLAlchemy create_all 不会修改旧表结构，补齐这个列避免旧 SQLite 库启动后查询直接 500。
+        cur.execute("PRAGMA table_info(api_keys)")
+        api_key_cols = {row[1] for row in cur.fetchall()}
+        if api_key_cols and "retry_after_seconds" not in api_key_cols:
+            cur.execute("ALTER TABLE api_keys ADD COLUMN retry_after_seconds INTEGER")
+
         conn.commit()
     finally:
         conn.close()
@@ -229,6 +237,7 @@ class APIKey(Base):
     is_active = Column(Boolean, default=True)
     usage_count = Column(Integer, default=0)
     last_failure = Column(DateTime, nullable=True) # 记录上次失败时间
+    retry_after_seconds = Column(Integer, nullable=True) # 上游返回的 Retry-After，用于动态冷却
 
 class ModelMapping(Base):
     __tablename__ = "model_mappings"
