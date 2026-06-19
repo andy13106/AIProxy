@@ -1037,7 +1037,9 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 )
                 await mark_key_rate_limited(callback_session, key_id, retry_after=retry_after)
             elif is_transient_network_error(error_text):
-                await mark_key_rate_limited(callback_session, key_id, retry_after=30)
+                await mark_key_rate_limited(callback_session, key_id, retry_after=15)
+            else:
+                await mark_key_rate_limited(callback_session, key_id, retry_after=15)
 
     async with AsyncSessionLocal() as session:
         # 获取模型映射
@@ -1074,7 +1076,10 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                     request_stream=request_stream,
                 )
                 completion_kwargs["timeout"] = max(1.0, min(per_key_timeout, remaining))
-                completion_kwargs["num_retries"] = max(0, int(settings.upstream_max_retries))
+                # litellm 的 num_retries 会在内部重试时重置 timeout，
+                # 导致实际耗时 = timeout × (num_retries+1)，完全打破 total_deadline 约束。
+                # 因此禁用 litellm 内部重试，由 AIProxy 的 key 遍历 + total_deadline 控制重试。
+                completion_kwargs["num_retries"] = 0
                 logger.debug(
                     f"Trying provider={provider.name}, key_id={api_key.id}, model={clean_real_model}, "
                     f"timeout={completion_kwargs['timeout']:.2f}, remaining={remaining:.2f}"
@@ -1169,9 +1174,16 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 elif is_transient_network_error(error_text):
                     had_transient_network_error = True
                     try:
-                        await mark_key_rate_limited(session, api_key.id, retry_after=30)
+                        # 网络瞬断冷却时间短一些，让 key 能较快恢复重试
+                        await mark_key_rate_limited(session, api_key.id, retry_after=15)
                     except Exception as mark_err:
                         logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
+                else:
+                    # 其他未知错误也短暂冷却，避免反复快速失败
+                    try:
+                        await mark_key_rate_limited(session, api_key.id, retry_after=15)
+                    except Exception as mark_err:
+                        logger.warning(f"Failed to cool down failed key {api_key.id}: {mark_err}")
                 continue
 
         if hit_total_timeout:

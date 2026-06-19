@@ -232,6 +232,18 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
         return _order_keys_for_provider(provider_id, eligible_keys)
 
     retry_after = max(1, int(earliest_available_in or cooldown_sec))
+    # 如果所有 key 的冷却时间都很短，说明是网络瞬断而非限流，返回 503
+    all_short_cooldown = all(
+        (getattr(k, "retry_after_seconds", None) or cooldown_sec) <= 30
+        for k in keys
+        if k.last_failure
+    )
+    if all_short_cooldown and keys:
+        raise HTTPException(
+            status_code=503,
+            detail=f"All upstream keys temporarily unavailable (network issue). Retry in ~{retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
     raise HTTPException(
         status_code=429,
         detail=f"All upstream keys are rate limited. Retry in ~{retry_after}s.",
@@ -470,9 +482,14 @@ async def execute_image_generation(body: dict) -> dict:
                         logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
                 elif is_transient_network_error(error_text):
                     try:
-                        await mark_key_rate_limited(session, api_key.id, retry_after=30)
+                        await mark_key_rate_limited(session, api_key.id, retry_after=15)
                     except Exception as mark_err:
                         logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
+                else:
+                    try:
+                        await mark_key_rate_limited(session, api_key.id, retry_after=15)
+                    except Exception as mark_err:
+                        logger.warning(f"Failed to cool down failed key {api_key.id}: {mark_err}")
                 continue
 
         raise HTTPException(status_code=502, detail="All upstream keys failed for image generation.")
