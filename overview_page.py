@@ -1,7 +1,6 @@
 import streamlit as st
 from sqlalchemy import func
 from db import SessionLocal, UsageLog
-import pandas as pd
 import datetime
 
 
@@ -53,14 +52,14 @@ def render_overview_page():
         c3.metric("今日生成图片", f"{total_images_today:,}")
 
         st.subheader("今日按模型汇总")
-        summary_df = pd.DataFrame([{
+        summary_df = [{
             "模型": row.model_name,
             "请求次数": row.request_count or 0,
             "Prompt Tokens": row.prompt_tokens or 0,
             "Completion Tokens": row.completion_tokens or 0,
             "Total Tokens": row.total_tokens or 0,
             "图片数": row.images_count or 0,
-        } for row in today_summary])
+        } for row in today_summary]
         st.dataframe(summary_df, width="stretch", hide_index=True)
     else:
         st.info("今天还没有有效使用记录。")
@@ -156,14 +155,14 @@ def render_overview_page():
                 c3.metric("范围内图片数", f"{(totals[4] or 0):,}")
 
                 if detail_logs:
-                    detail_df = pd.DataFrame([{
+                    detail_df = [{
                         "ID": log.id,
                         "Prompt": log.prompt_tokens,
                         "Completion": log.completion_tokens,
                         "Total": log.total_tokens,
                         "图片": log.images_count,
                         "时间": log.timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                    } for log in detail_logs])
+                    } for log in detail_logs]
                     st.dataframe(detail_df, width="stretch", hide_index=True)
 
                     p1, p2, p3 = st.columns([1, 2, 1])

@@ -2,7 +2,6 @@ import streamlit as st
 from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import Session
 from db import SessionLocal, Provider, APIKey, ModelMapping, UsageLog, Base, ToolDefaultModel, SUPPORTED_PROVIDER_TYPES
-import pandas as pd
 import datetime
 import requests
 import os
