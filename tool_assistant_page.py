@@ -4,7 +4,6 @@ from utils import detect_proxy_base_url
 import json
 import os
 
-from config_assistant.env_detector import is_running_in_docker
 from config_assistant.config_detector import ConfigDetector
 from config_assistant.backup_manager import BackupManager
 from config_assistant.injectors.claude_code import ClaudeCodeInjector
@@ -23,7 +22,7 @@ def render_tool_assistant_page():
         st.session_state.assistant_proxy_base_host = detected_base_host
 
     st.caption("自动配置写入的是当前服务端机器上的配置文件，无法直接改浏览器所在远端电脑的本地文件。")
-    st.caption("如果你在 Docker 或局域网给其它电脑使用，请把下方地址改成客户端可访问的代理地址。")
+    st.caption("如果你在局域网给其它电脑使用，请把下方地址改成客户端可访问的代理地址。")
 
     base_host_input = st.text_input(
         "客户端访问代理地址（不带 /v1）",
@@ -73,8 +72,6 @@ def render_tool_assistant_page():
             default_model=tool_model_config.get(tool_id, model_hint),
         )
 
-    running_in_docker = is_running_in_docker()
-
     tab_smart, tab_manual = st.tabs(["🤖 智能配置", "📋 手动配置"])
 
     with tab_smart:
@@ -108,219 +105,206 @@ def render_tool_assistant_page():
 
         st.divider()
 
-        if running_in_docker:
-            st.warning("""
-            ⚠️ **Docker环境检测到**
-            
-            自动配置功能需要直接访问宿主机文件系统，当前运行在Docker容器中，
-            **无法自动修改您的本地AI工具配置文件**。
-            
-            请使用以下方式之一：
-            1. 下载配置文件，手动复制到工具配置目录
-            2. 在本机直接运行项目（python + streamlit方式）
-            3. 使用「手动配置」Tab
-            """)
-        else:
-            st.info("自动扫描并配置本地AI工具，实现零手动配置体验。")
-            
-            config_detector = ConfigDetector()
-            backup_manager = BackupManager()
+        st.info("自动扫描并配置本地AI工具，实现零手动配置体验。")
 
-            detector_signature = json.dumps(config_detector.TOOL_CONFIGS, ensure_ascii=False, sort_keys=True)
-            if st.session_state.get("config_detector_signature") != detector_signature:
-                st.session_state.config_detector_signature = detector_signature
-                st.session_state.scan_result = None
-                st.session_state.selected_tools = {}
-            
-            if "scan_result" not in st.session_state:
-                st.session_state.scan_result = None
-            if "selected_tools" not in st.session_state:
-                st.session_state.selected_tools = {}
-            
-            c_scan, c_restore = st.columns([3, 1])
-            with c_scan:
-                if st.button("🔍 一键智能扫描配置文件", type="primary", width="stretch", key="scan_smart"):
-                    with st.spinner("AI正在扫描系统中的配置文件..."):
-                        st.session_state.scan_result = config_detector.detect_all()
-            with c_restore:
-                if st.button("↩️ 一键恢复备份", width="stretch", key="restore_smart"):
-                    backups = backup_manager.list_backups()
-                    if backups:
-                        st.session_state.show_restore = True
+        config_detector = ConfigDetector()
+        backup_manager = BackupManager()
+
+        detector_signature = json.dumps(config_detector.TOOL_CONFIGS, ensure_ascii=False, sort_keys=True)
+        if st.session_state.get("config_detector_signature") != detector_signature:
+            st.session_state.config_detector_signature = detector_signature
+            st.session_state.scan_result = None
+            st.session_state.selected_tools = {}
+
+        if "scan_result" not in st.session_state:
+            st.session_state.scan_result = None
+        if "selected_tools" not in st.session_state:
+            st.session_state.selected_tools = {}
+
+        c_scan, c_restore = st.columns([3, 1])
+        with c_scan:
+            if st.button("🔍 一键智能扫描配置文件", type="primary", width="stretch", key="scan_smart"):
+                with st.spinner("AI正在扫描系统中的配置文件..."):
+                    st.session_state.scan_result = config_detector.detect_all()
+        with c_restore:
+            if st.button("↩️ 一键恢复备份", width="stretch", key="restore_smart"):
+                backups = backup_manager.list_backups()
+                if backups:
+                    st.session_state.show_restore = True
+                else:
+                    st.info("暂无备份文件可恢复")
+
+        if st.session_state.get("show_restore", False):
+            with st.expander("选择备份文件恢复", expanded=True):
+                backups = backup_manager.list_backups()
+                if backups:
+                    for b in backups[:5]:
+                        col1, col2 = st.columns([4, 1])
+                        col1.write(f"📄 {b['filename']}")
+                        if col2.button("恢复", key=f"restore_{b['filename']}_smart"):
+                            st.info("请手动选择要恢复到的配置文件路径")
+                st.button("关闭恢复面板", on_click=lambda: st.session_state.__setitem__("show_restore", False), key="close_restore_smart")
+
+        if st.session_state.scan_result:
+            st.markdown("---")
+            st.markdown("**检测结果：**")
+
+            detected_any = False
+            for tool_id, result in st.session_state.scan_result.items():
+                col1, col2, col3, col4 = st.columns([1, 3, 5, 2])
+                if result["found"]:
+                    detected_any = True
+                    col1.success("✅")
+                    col2.write(f"**{result['display_name']}**")
+                    col3.code(result["path"], language="text")
+                    default_checked = tool_id in ["claude_code", "opencode", "codex"]
+                    st.session_state.selected_tools[tool_id] = col4.checkbox(
+                        "自动配置",
+                        value=default_checked,
+                        key=f"check_{tool_id}_smart"
+                    )
+                else:
+                    col1.error("❌")
+                    col2.write(f"**{result['display_name']}**")
+                    if tool_id == "opencode":
+                        opencode_paths = config_detector.TOOL_CONFIGS["opencode"]["standard_paths"]
+                        col3.caption("未检测到，候选位置（按优先级）：")
+                        col3.code("\n".join(opencode_paths), language="text")
                     else:
-                        st.info("暂无备份文件可恢复")
-            
-            if st.session_state.get("show_restore", False):
-                with st.expander("选择备份文件恢复", expanded=True):
-                    backups = backup_manager.list_backups()
-                    if backups:
-                        for b in backups[:5]:
-                            col1, col2 = st.columns([4, 1])
-                            col1.write(f"📄 {b['filename']}")
-                            if col2.button("恢复", key=f"restore_{b['filename']}_smart"):
-                                st.info("请手动选择要恢复到的配置文件路径")
-                    st.button("关闭恢复面板", on_click=lambda: st.session_state.__setitem__("show_restore", False), key="close_restore_smart")
-            
-            if st.session_state.scan_result:
-                st.markdown("---")
-                st.markdown("**检测结果：**")
-                
-                detected_any = False
-                for tool_id, result in st.session_state.scan_result.items():
-                    col1, col2, col3, col4 = st.columns([1, 3, 5, 2])
-                    if result["found"]:
-                        detected_any = True
-                        col1.success("✅")
-                        col2.write(f"**{result['display_name']}**")
-                        col3.code(result["path"], language="text")
-                        default_checked = tool_id in ["claude_code", "opencode", "codex"]
-                        st.session_state.selected_tools[tool_id] = col4.checkbox(
-                            "自动配置",
-                            value=default_checked,
-                            key=f"check_{tool_id}_smart"
-                        )
-                    else:
-                        col1.error("❌")
-                        col2.write(f"**{result['display_name']}**")
-                        if tool_id == "opencode":
-                            opencode_paths = config_detector.TOOL_CONFIGS["opencode"]["standard_paths"]
-                            col3.caption("未检测到，候选位置（按优先级）：")
-                            col3.code("\n".join(opencode_paths), language="text")
-                        else:
-                            col3.caption(f"未检测到，标准位置: {result['config_path_hint']}")
-                        st.session_state.selected_tools[tool_id] = col4.checkbox(
-                            "创建并配置",
-                            value=False,
-                            key=f"check_create_{tool_id}_smart"
-                        )
-                
-                st.markdown("---")
-                
-                selected_count = sum(1 for v in st.session_state.selected_tools.values() if v)
-                if selected_count > 0:
-                    st.caption(f"已选择 {selected_count} 个工具进行自动配置")
-                    tool_hints = []
-                    if st.session_state.selected_tools.get("claude_code"):
-                        tool_hints.append(f"ClaudeCode (默认模型: {tool_model_config.get('claude_code', model_hint)})")
-                    if st.session_state.selected_tools.get("opencode"):
-                        tool_hints.append(f"OpenCode (默认模型: {tool_model_config.get('opencode', model_hint)}, 注入 {len(model_list)} 个代理模型)")
-                    if st.session_state.selected_tools.get("openclaw"):
-                        tool_hints.append(f"OpenClaw (默认模型: {tool_model_config.get('openclaw', model_hint)})")
-                    if st.session_state.selected_tools.get("hermes"):
-                        tool_hints.append(f"Hermes (默认模型: {tool_model_config.get('hermes', model_hint)})")
-                    if st.session_state.selected_tools.get("codex"):
-                        tool_hints.append(f"Codex (默认模型: {tool_model_config.get('codex', model_hint)}, OpenAI Responses 协议)")
-                    if tool_hints:
-                        st.info("将为以下工具执行配置：\n- " + "\n- ".join(tool_hints))
-                    
-                    col_exec, col_preview = st.columns(2)
-                    if col_exec.button("✅ 确认执行配置", width="stretch", key="exec_config_smart"):
-                        success_count = 0
-                        fail_count = 0
-                        messages = []
-                        
-                        with st.spinner("正在配置..."):
-                            for tool_id, selected in st.session_state.selected_tools.items():
-                                if not selected:
-                                    continue
-                                
-                                result = st.session_state.scan_result[tool_id]
-                                config_path = result["path"] or config_detector.get_tool_config_path(tool_id)
-                                
-                                if result["path"]:
-                                    backup_path = backup_manager.create_backup(config_path)
-                                    if backup_path:
-                                        messages.append(f"✅ [{result['display_name']}] 已备份: {os.path.basename(backup_path)}")
-                                
-                                config_detector.ensure_config_dir(tool_id)
-                                
-                                injector = create_injector(tool_id, config_path)
-                                
-                                if injector:
-                                    ok, err = injector.inject()
-                                    if ok:
-                                        save_ok, save_err = injector.save_config()
-                                        if save_ok:
-                                            if backup_manager.validate_config_file(config_path):
-                                                success_count += 1
-                                                messages.append(f"✅ [{result['display_name']}] 配置写入成功")
-                                                messages.append(injector.generate_description())
-                                            else:
-                                                fail_count += 1
-                                                backup_manager.restore_latest(tool_id, config_path)
-                                                messages.append(f"❌ [{result['display_name']}] 配置验证失败，已自动回滚")
+                        col3.caption(f"未检测到，标准位置: {result['config_path_hint']}")
+                    st.session_state.selected_tools[tool_id] = col4.checkbox(
+                        "创建并配置",
+                        value=False,
+                        key=f"check_create_{tool_id}_smart"
+                    )
+
+            st.markdown("---")
+
+            selected_count = sum(1 for v in st.session_state.selected_tools.values() if v)
+            if selected_count > 0:
+                st.caption(f"已选择 {selected_count} 个工具进行自动配置")
+                tool_hints = []
+                if st.session_state.selected_tools.get("claude_code"):
+                    tool_hints.append(f"ClaudeCode (默认模型: {tool_model_config.get('claude_code', model_hint)})")
+                if st.session_state.selected_tools.get("opencode"):
+                    tool_hints.append(f"OpenCode (默认模型: {tool_model_config.get('opencode', model_hint)}, 注入 {len(model_list)} 个代理模型)")
+                if st.session_state.selected_tools.get("openclaw"):
+                    tool_hints.append(f"OpenClaw (默认模型: {tool_model_config.get('openclaw', model_hint)})")
+                if st.session_state.selected_tools.get("hermes"):
+                    tool_hints.append(f"Hermes (默认模型: {tool_model_config.get('hermes', model_hint)})")
+                if st.session_state.selected_tools.get("codex"):
+                    tool_hints.append(f"Codex (默认模型: {tool_model_config.get('codex', model_hint)}, OpenAI Responses 协议)")
+                if tool_hints:
+                    st.info("将为以下工具执行配置：\n- " + "\n- ".join(tool_hints))
+
+                col_exec, col_preview = st.columns(2)
+                if col_exec.button("✅ 确认执行配置", width="stretch", key="exec_config_smart"):
+                    success_count = 0
+                    fail_count = 0
+                    messages = []
+
+                    with st.spinner("正在配置..."):
+                        for tool_id, selected in st.session_state.selected_tools.items():
+                            if not selected:
+                                continue
+
+                            result = st.session_state.scan_result[tool_id]
+                            config_path = result["path"] or config_detector.get_tool_config_path(tool_id)
+
+                            if result["path"]:
+                                backup_path = backup_manager.create_backup(config_path)
+                                if backup_path:
+                                    messages.append(f"✅ [{result['display_name']}] 已备份: {os.path.basename(backup_path)}")
+
+                            config_detector.ensure_config_dir(tool_id)
+
+                            injector = create_injector(tool_id, config_path)
+
+                            if injector:
+                                ok, err = injector.inject()
+                                if ok:
+                                    save_ok, save_err = injector.save_config()
+                                    if save_ok:
+                                        if backup_manager.validate_config_file(config_path):
+                                            success_count += 1
+                                            messages.append(f"✅ [{result['display_name']}] 配置写入成功")
+                                            messages.append(injector.generate_description())
                                         else:
                                             fail_count += 1
-                                            messages.append(f"❌ [{result['display_name']}] 写入失败: {save_err}")
+                                            backup_manager.restore_latest(tool_id, config_path)
+                                            messages.append(f"❌ [{result['display_name']}] 配置验证失败，已自动回滚")
                                     else:
                                         fail_count += 1
-                                        messages.append(f"❌ [{result['display_name']}] 注入失败: {err}")
-                        
-                        st.divider()
-                        if fail_count == 0:
-                            st.success(f"🎉 全部配置完成！成功 {success_count} 个工具")
+                                        messages.append(f"❌ [{result['display_name']}] 写入失败: {save_err}")
+                                else:
+                                    fail_count += 1
+                                    messages.append(f"❌ [{result['display_name']}] 注入失败: {err}")
+
+                    st.divider()
+                    if fail_count == 0:
+                        st.success(f"🎉 全部配置完成！成功 {success_count} 个工具")
+                    else:
+                        st.warning(f"配置完成: 成功 {success_count} 个，失败 {fail_count} 个")
+
+                    for msg in messages:
+                        if msg.startswith("✅"):
+                            st.write(msg)
+                        elif msg.startswith("❌"):
+                            st.error(msg)
                         else:
-                            st.warning(f"配置完成: 成功 {success_count} 个，失败 {fail_count} 个")
-                        
-                        for msg in messages:
-                            if msg.startswith("✅"):
-                                st.write(msg)
-                            elif msg.startswith("❌"):
-                                st.error(msg)
-                            else:
-                                st.caption(msg)
-                    
-                    if col_preview.button("👁️ 查看配置变更预览", width="stretch", key="preview_smart"):
-                        st.session_state.show_preview = True
-                    
-                    if st.session_state.get("show_preview", False):
-                        with st.expander("配置变更预览", expanded=True):
-                            for tool_id, selected in st.session_state.selected_tools.items():
-                                if not selected:
-                                    continue
-                                result = st.session_state.scan_result[tool_id]
-                                config_path = result["path"] or config_detector.get_tool_config_path(tool_id)
-                                
-                                injector = create_injector(tool_id, config_path)
-                                
-                                if injector:
-                                    ok, err = injector.inject()
-                                    st.markdown(f"**{result['display_name']}**")
-                                    if not ok:
-                                        st.error(f"预览生成失败: {err or '未知错误'}")
-                                        st.caption(f"配置路径: {config_path}")
-                                        try:
-                                            with open(config_path, "r", encoding="utf-8") as f:
-                                                raw_text = f.read()
-                                            if raw_text.strip():
-                                                st.caption("原始文件内容（无法解析为标准 JSON）")
-                                                st.code(raw_text, language="json")
-                                            else:
-                                                st.caption("原始配置文件为空。")
-                                        except Exception:
-                                            st.caption("无法读取原始配置文件。")
-                                        st.markdown("---")
-                                        continue
+                            st.caption(msg)
 
-                                    st.info(injector.generate_description())
-                                    col_orig, col_mod = st.columns(2)
-                                    col_orig.caption("原始配置")
-                                    col_mod.caption("修改后配置")
+                if col_preview.button("👁️ 查看配置变更预览", width="stretch", key="preview_smart"):
+                    st.session_state.show_preview = True
 
-                                    if hasattr(injector, "original_text") and hasattr(injector, "modified_text"):
-                                        original_text = (getattr(injector, "original_text", "") or "").strip()
-                                        modified_text = (getattr(injector, "modified_text", "") or "").strip()
-                                        language = "toml" if str(config_path).endswith(".toml") else "yaml"
-                                        col_orig.code(original_text or "(空)", language=language)
-                                        col_mod.code(modified_text or "(空)", language=language)
-                                    else:
-                                        col_orig.json(injector.original_config)
-                                        col_mod.json(injector.modified_config)
+                if st.session_state.get("show_preview", False):
+                    with st.expander("配置变更预览", expanded=True):
+                        for tool_id, selected in st.session_state.selected_tools.items():
+                            if not selected:
+                                continue
+                            result = st.session_state.scan_result[tool_id]
+                            config_path = result["path"] or config_detector.get_tool_config_path(tool_id)
+
+                            injector = create_injector(tool_id, config_path)
+
+                            if injector:
+                                ok, err = injector.inject()
+                                st.markdown(f"**{result['display_name']}**")
+                                if not ok:
+                                    st.error(f"预览生成失败: {err or '未知错误'}")
+                                    st.caption(f"配置路径: {config_path}")
+                                    try:
+                                        with open(config_path, "r", encoding="utf-8") as f:
+                                            raw_text = f.read()
+                                        if raw_text.strip():
+                                            st.caption("原始文件内容（无法解析为标准 JSON）")
+                                            st.code(raw_text, language="json")
+                                        else:
+                                            st.caption("原始配置文件为空。")
+                                    except Exception:
+                                        st.caption("无法读取原始配置文件。")
                                     st.markdown("---")
-                            if st.button("关闭预览", key="close_preview_smart"):
-                                st.session_state.show_preview = False
-                else:
-                    st.info("请选择至少一个工具进行配置")
+                                    continue
+
+                                st.info(injector.generate_description())
+                                col_orig, col_mod = st.columns(2)
+                                col_orig.caption("原始配置")
+                                col_mod.caption("修改后配置")
+
+                                if hasattr(injector, "original_text") and hasattr(injector, "modified_text"):
+                                    original_text = (getattr(injector, "original_text", "") or "").strip()
+                                    modified_text = (getattr(injector, "modified_text", "") or "").strip()
+                                    language = "toml" if str(config_path).endswith(".toml") else "yaml"
+                                    col_orig.code(original_text or "(空)", language=language)
+                                    col_mod.code(modified_text or "(空)", language=language)
+                                else:
+                                    col_orig.json(injector.original_config)
+                                    col_mod.json(injector.modified_config)
+                                st.markdown("---")
+                        if st.button("关闭预览", key="close_preview_smart"):
+                            st.session_state.show_preview = False
+            else:
+                st.info("请选择至少一个工具进行配置")
 
     with tab_manual:
         st.info("高级用户可以使用手动配置方式，生成配置示例和启动脚本。")

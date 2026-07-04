@@ -32,9 +32,8 @@ def render_provider_page():
   VERTEXAI_PROJECT=your-gcp-project-id
   VERTEXAI_LOCATION=us-central1
   ```
-- Docker 部署时需挂载 credentials 目录
 
-**AWS Bedrock（IAM 认证）**  
+**AWS Bedrock（IAM 认证）**
 通过 AWS IAM 认证，无需 API Key。  
 - API Base URL：留空  
 - API Key：填任意占位符  
