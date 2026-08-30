@@ -1,3 +1,5 @@
+import secrets
+
 import streamlit as st
 import os
 
@@ -23,7 +25,8 @@ apply_playground_theme()
 
 _admin_password = os.getenv("ADMIN_PASSWORD", "")
 _admin_host = (os.getenv("ADMIN_HOST", "0.0.0.0") or "").strip().lower()
-_is_local_admin_host = _admin_host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+# 注意：0.0.0.0 表示监听所有网卡（局域网可达），不属于"仅本地"
+_is_local_admin_host = _admin_host in {"127.0.0.1", "localhost", "::1"}
 
 if not _admin_password and not _is_local_admin_host:
     st.error("安全限制：ADMIN_HOST 非本地地址时，必须设置 ADMIN_PASSWORD。")
@@ -37,7 +40,7 @@ if _admin_password:
         st.title("🔐 管理面板登录")
         pwd = st.text_input("请输入管理密码", type="password")
         if st.button("登录"):
-            if pwd == _admin_password:
+            if secrets.compare_digest(pwd.encode("utf-8"), _admin_password.encode("utf-8")):
                 st.session_state.admin_authenticated = True
                 st.rerun()
             else:

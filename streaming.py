@@ -1,4 +1,4 @@
-"""流式响应处理模块"""
+﻿"""流式响应处理模块"""
 
 import asyncio
 import json
@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
 
-from config import logger, settings
+from config import logger
 from converters import (
     convert_openai_response_to_anthropic,
     extract_usage,
@@ -18,15 +18,36 @@ from converters import (
 )
 
 
-async def iter_stream_with_heartbeat(response: Any, heartbeat_sec: float) -> AsyncGenerator[Any, None]:
-    """带心跳的流式迭代器"""
+async def iter_stream_with_heartbeat(
+    response: Any,
+    heartbeat_sec: float,
+    max_total_sec: Optional[float] = None,
+) -> AsyncGenerator[Any, None]:
+    """带心跳的流式迭代器。
+
+    max_total_sec > 0 时，整个流的累计时长超过该值会抛出 asyncio.TimeoutError，
+    防止上游挂死后靠心跳无限空转。
+    """
     iterator = response.__aiter__()
     pending_next = asyncio.create_task(iterator.__anext__())
     timeout = max(1.0, float(heartbeat_sec))
+    deadline = time.monotonic() + float(max_total_sec) if max_total_sec and max_total_sec > 0 else None
     try:
         while True:
-            done, _ = await asyncio.wait({pending_next}, timeout=timeout)
+            wait = timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError(
+                        f"Stream exceeded max duration ({max_total_sec}s)"
+                    )
+                wait = min(wait, remaining)
+            done, _ = await asyncio.wait({pending_next}, timeout=wait)
             if not done:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError(
+                        f"Stream exceeded max duration ({max_total_sec}s)"
+                    )
                 # SSE 注释行作为心跳，避免中间层空闲超时断开连接
                 yield None
                 continue
@@ -56,6 +77,7 @@ class StreamGenerator:
         log_usage_callback: Callable,
         stream_error_callback: Optional[Callable[[int, Exception], Awaitable[None]]] = None,
         heartbeat_sec: float = 15.0,
+        max_stream_duration_sec: float = 0.0,
     ):
         self.response = response
         self.model_name = model_name
@@ -66,6 +88,7 @@ class StreamGenerator:
         self.log_usage_callback = log_usage_callback
         self.stream_error_callback = stream_error_callback
         self.heartbeat_sec = heartbeat_sec
+        self.max_stream_duration_sec = max_stream_duration_sec
 
         self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.streamed_text_parts: list[str] = []
@@ -95,7 +118,9 @@ class StreamGenerator:
             )
 
         try:
-            async for maybe_chunk in iter_stream_with_heartbeat(self.response, self.heartbeat_sec):
+            async for maybe_chunk in iter_stream_with_heartbeat(
+                self.response, self.heartbeat_sec, self.max_stream_duration_sec
+            ):
                 if maybe_chunk is None:
                     yield ": ping\n\n"
                     continue
@@ -320,250 +345,3 @@ class AnthropicToolStreamGenerator:
                 self.usage_totals["completion_tokens"] = completion_tokens
                 self.usage_totals["total_tokens"] = prompt_tokens + completion_tokens
             await self.log_usage_callback(self.key_id, self.model_name, {"usage": self.usage_totals})
-
-class ResponsesStreamGenerator:
-    """将 OpenAI Chat Completion 流式响应实时转换为 Responses API SSE 事件。"""
-
-    def __init__(
-        self,
-        response: Any,
-        body: dict[str, Any],
-        input_items: list[dict[str, Any]],
-        model_name: str,
-        clean_real_model: str,
-        messages: list,
-        key_id: int,
-        log_usage_callback: Callable,
-        heartbeat_sec: float = 15.0,
-    ):
-        self.response = response
-        self.body = body
-        self.input_items = input_items
-        self.model_name = model_name
-        self.clean_real_model = clean_real_model
-        self.messages = messages
-        self.key_id = key_id
-        self.log_usage_callback = log_usage_callback
-        self.heartbeat_sec = heartbeat_sec
-        self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        self.streamed_text_parts: list[str] = []
-        self.response_id = f"resp_{uuid.uuid4().hex[:24]}"
-        self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
-        self.sequence_number = 0
-        # Tool call 累积状态
-        self.tool_calls: dict[int, dict[str, Any]] = {}
-
-    def _next_seq(self) -> int:
-        self.sequence_number += 1
-        return self.sequence_number
-
-    def _sse(self, event_type: str, payload: dict[str, Any]) -> str:
-        data = {"type": event_type, "sequence_number": self._next_seq()}
-        data.update(payload)
-        return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-    async def generate(self) -> AsyncGenerator[str, None]:
-        # 发送 response.created
-        created_payload = self._build_response_payload(status="in_progress", output=[])
-        yield self._sse("response.created", {"response": created_payload})
-
-        # 发送 output_item.added (message item)
-        msg_item = {
-            "id": self.message_id,
-            "type": "message",
-            "status": "in_progress",
-            "role": "assistant",
-            "content": [],
-        }
-        yield self._sse("response.output_item.added", {"output_index": 0, "item": msg_item})
-
-        # 发送 content part added
-        content_part = {"type": "output_text", "text": "", "annotations": []}
-        yield self._sse(
-            "response.content_part.added",
-            {"item_id": self.message_id, "output_index": 0, "content_index": 0, "part": content_part},
-        )
-
-        text_started = False
-        final_finish_reason = None
-        try:
-            async for maybe_chunk in iter_stream_with_heartbeat(self.response, self.heartbeat_sec):
-                if maybe_chunk is None:
-                    yield ": ping\n\n"
-                    continue
-
-                chunk = maybe_chunk
-                try:
-                    payload = serialize_stream_chunk(chunk)
-                except Exception as e:
-                    logger.warning(f"流式chunk解析失败，跳过: {e}")
-                    continue
-
-                merge_usage(self.usage_totals, payload.get("usage"))
-                choices = payload.get("choices") or [{}]
-                choice = choices[0]
-                final_finish_reason = choice.get("finish_reason") or final_finish_reason
-                delta = choice.get("delta") or {}
-
-                # 处理文本内容
-                content = delta.get("content")
-                if content:
-                    if not text_started:
-                        text_started = True
-                    self.streamed_text_parts.append(content)
-                    yield self._sse(
-                        "response.output_text.delta",
-                        {
-                            "item_id": self.message_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": content,
-                        },
-                    )
-
-                # 处理 tool call 增量
-                for tc_delta in delta.get("tool_calls") or []:
-                    tc_index = tc_delta.get("index", 0)
-                    if tc_index not in self.tool_calls:
-                        self.tool_calls[tc_index] = {
-                            "id": tc_delta.get("id") or f"fc_{uuid.uuid4().hex[:24]}",
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "call_id": tc_delta.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                            "name": "",
-                            "arguments": "",
-                        }
-                    tc = self.tool_calls[tc_index]
-                    fn_delta = tc_delta.get("function") or {}
-                    if fn_delta.get("name"):
-                        tc["name"] = fn_delta["name"]
-                    if fn_delta.get("arguments"):
-                        tc["arguments"] += fn_delta["arguments"]
-
-        except (asyncio.CancelledError, ConnectionError, Exception) as e:
-            if not isinstance(e, asyncio.CancelledError):
-                logger.error(f"Responses流式响应中断: {type(e).__name__}: {e}")
-            # 发送错误事件并立即终止，避免发送不完整数据
-            yield self._sse("error", {
-                "type": "error",
-                "error": {
-                    "type": "stream_error",
-                    "message": f"流式响应中断: {type(e).__name__}: {str(e)}",
-                },
-            })
-            yield "data: [DONE]\n\n"
-            await self._finalize_usage()
-            return
-
-        # 发送 text done
-        full_text = "".join(self.streamed_text_parts)
-        yield self._sse(
-            "response.output_text.done",
-            {
-                "item_id": self.message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": full_text,
-            },
-        )
-
-        # 发送 content part done
-        content_part_done = {"type": "output_text", "text": full_text, "annotations": []}
-        yield self._sse(
-            "response.content_part.done",
-            {"item_id": self.message_id, "output_index": 0, "content_index": 0, "part": content_part_done},
-        )
-
-        # 发送 message item done
-        msg_item_done = {
-            "id": self.message_id,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": full_text, "annotations": []}],
-        }
-        yield self._sse("response.output_item.done", {"output_index": 0, "item": msg_item_done})
-
-        # 处理 tool calls（如果有）
-        for tc_index in sorted(self.tool_calls.keys()):
-            tc = self.tool_calls[tc_index]
-            output_index = 1 + tc_index  # message 在 index 0
-            tc["status"] = "completed"
-            yield self._sse("response.output_item.added", {"output_index": output_index, "item": tc})
-            yield self._sse(
-                "response.function_call_arguments.delta",
-                {
-                    "item_id": tc["id"],
-                    "call_id": tc.get("call_id"),
-                    "output_index": output_index,
-                    "delta": tc.get("arguments") or "",
-                },
-            )
-            yield self._sse(
-                "response.function_call_arguments.done",
-                {
-                    "item_id": tc["id"],
-                    "call_id": tc.get("call_id"),
-                    "name": tc.get("name"),
-                    "output_index": output_index,
-                    "arguments": tc.get("arguments") or "{}",
-                },
-            )
-            yield self._sse("response.output_item.done", {"output_index": output_index, "item": tc})
-
-        # 补全 usage（如果流中没有提供）
-        if self.usage_totals["total_tokens"] == 0:
-            prompt_tokens = safe_token_count(self.clean_real_model, messages=self.messages)
-            completion_tokens = safe_token_count(self.clean_real_model, text=full_text)
-            self.usage_totals["prompt_tokens"] = prompt_tokens
-            self.usage_totals["completion_tokens"] = completion_tokens
-            self.usage_totals["total_tokens"] = prompt_tokens + completion_tokens
-
-        await self.log_usage_callback(self.key_id, self.model_name, {"usage": self.usage_totals})
-
-        # 构建 output items
-        output_items = []
-        if full_text:
-            output_items.append(msg_item_done)
-        for tc_index in sorted(self.tool_calls.keys()):
-            output_items.append(self.tool_calls[tc_index])
-
-        # 发送 response.completed
-        completed_payload = self._build_response_payload(status="completed", output=output_items)
-        yield self._sse("response.completed", {"response": completed_payload})
-
-        yield "data: [DONE]\n\n"
-
-    def _build_response_payload(self, status: str, output: list[dict[str, Any]]) -> dict[str, Any]:
-        body = self.body
-        return {
-            "id": self.response_id,
-            "object": "response",
-            "created_at": int(time.time()),
-            "status": status,
-            "error": None,
-            "incomplete_details": None,
-            "instructions": body.get("instructions"),
-            "max_output_tokens": body.get("max_output_tokens") or body.get("max_tokens"),
-            "model": self.model_name,
-            "input": self.input_items,
-            "output": output,
-            "output_text": "".join(self.streamed_text_parts),
-            "parallel_tool_calls": body.get("parallel_tool_calls", True),
-            "previous_response_id": body.get("previous_response_id"),
-            "reasoning": body.get("reasoning") or {"effort": None, "summary": None},
-            "store": body.get("store", True),
-            "temperature": body.get("temperature", 0.7),
-            "text": body.get("text") or {"format": {"type": "text"}},
-            "tool_choice": body.get("tool_choice", "auto"),
-            "tools": body.get("tools", []),
-            "top_p": body.get("top_p", 1),
-            "truncation": body.get("truncation", "disabled"),
-            "usage": {
-                "input_tokens": self.usage_totals["prompt_tokens"],
-                "output_tokens": self.usage_totals["completion_tokens"],
-                "total_tokens": self.usage_totals["total_tokens"],
-            },
-            "user": body.get("user"),
-            "metadata": body.get("metadata") or {},
-        }

@@ -27,6 +27,11 @@ if not os.path.exists(DATA_DIR):
 DB_FILE_PATH = os.path.join(DATA_DIR, "proxy.db")
 
 
+def utc_now() -> datetime.datetime:
+    """当前 UTC 时间（naive，与旧库中已存数据保持一致；datetime.utcnow 已废弃）"""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 def ensure_sqlite_schema() -> None:
     """轻量 SQLite 迁移：补齐新增列/表，避免旧库启动时报错。"""
     conn = sqlite3.connect(DB_FILE_PATH)
@@ -256,7 +261,7 @@ class UsageLog(Base):
     completion_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
     images_count = Column(Integer, default=0)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    timestamp = Column(DateTime, default=utc_now)
 
 
 class ToolDefaultModel(Base):
@@ -265,7 +270,7 @@ class ToolDefaultModel(Base):
     id = Column(Integer, primary_key=True)
     tool_id = Column(String(50), unique=True, nullable=False)  # 工具 ID，如 "claude_code", "opencode" 等
     default_model = Column(String(100), nullable=False)  # 默认模型名称
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class PlaygroundChatSession(Base):
@@ -275,8 +280,8 @@ class PlaygroundChatSession(Base):
     title = Column(String(200), nullable=False, default="新对话")
     provider_name = Column(String(100), nullable=True)
     model_name = Column(String(200), nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class PlaygroundChatMessage(Base):
@@ -290,7 +295,7 @@ class PlaygroundChatMessage(Base):
     seq = Column(Integer, nullable=False)
     role = Column(String(20), nullable=False)
     content = Column(Text, nullable=True, default="")
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
 
 class PlaygroundChatAttachment(Base):
@@ -304,7 +309,7 @@ class PlaygroundChatAttachment(Base):
     file_size = Column(Integer, nullable=False, default=0)
     mime_type = Column(String(100), nullable=True)
     attachment_type = Column(String(20), nullable=False, default="unknown")
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
 
 async def init_db():

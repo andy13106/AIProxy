@@ -193,7 +193,7 @@ def _create_new_session(provider_names: list[str], persist: bool = True) -> str:
 
 
 def _upsert_session_to_db(session_data: dict[str, Any]) -> None:
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     with SessionLocal() as session:
         db_obj = (
             session.query(PlaygroundChatSession)
@@ -282,7 +282,7 @@ def _load_sessions_from_db(provider_names: list[str]) -> tuple[dict[str, dict[st
             sess = {
                 "id": sid,
                 "title": db_item.title or "新对话",
-                "created_at": (db_item.created_at or datetime.datetime.utcnow()).isoformat(),
+                "created_at": (db_item.created_at or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)).isoformat(),
                 "messages": [],
                 "provider": provider,
                 "model": db_item.model_name,
@@ -1120,6 +1120,10 @@ def _render_session_panel(
                     file_bytes = uploaded_file.read()
                     file_size = len(file_bytes)
                     uploaded_file.seek(0)
+
+                if file_size > 20 * 1024 * 1024:
+                    st.warning(f"文件过大（上限 20MB），已跳过：{filename}")
+                    continue
 
                 already_exists = any(
                     _get_attachment_data(e.get("id")) is not None

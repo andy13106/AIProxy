@@ -244,8 +244,44 @@ function currentSession() {
   return S.sessions[S.currentSessionId];
 }
 
+const TOKEN_STORAGE_KEY = "aiproxy_playground_token";
+
+function getAuthToken() {
+  try { return localStorage.getItem(TOKEN_STORAGE_KEY) || ""; } catch { return ""; }
+}
+
+function authHeaders(extra = {}) {
+  const headers = Object.assign({}, extra);
+  const token = getAuthToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return headers;
+}
+
+function promptForToken() {
+  const token = window.prompt("访问 Playground 需要 MASTER_KEY（代理主密钥），请输入：");
+  if (token && token.trim()) {
+    try { localStorage.setItem(TOKEN_STORAGE_KEY, token.trim()); } catch {}
+    return true;
+  }
+  return false;
+}
+
+function handleAuthFailure() {
+  if (promptForToken()) return true;
+  alert("未提供 MASTER_KEY，无法访问 Playground。");
+  return false;
+}
+
 async function api(url, opts = {}) {
-  const res = await fetch(url, opts);
+  const baseHeaders = opts.headers || {};
+  let res = await fetch(url, Object.assign({}, opts, { headers: authHeaders(baseHeaders) }));
+  if (res.status === 401) {
+    if (!handleAuthFailure()) {
+      const t = await res.text();
+      throw new Error(t || "HTTP 401");
+    }
+    res = await fetch(url, Object.assign({}, opts, { headers: authHeaders(baseHeaders) }));
+  }
   if (!res.ok) {
     const t = await res.text();
     throw new Error(t || `HTTP ${res.status}`);
@@ -263,9 +299,17 @@ async function bootstrap() {
 
 async function uploadFiles(files) {
   for (const file of files) {
+    if (file.size > 20 * 1024 * 1024) {
+      showToast(`文件过大，已跳过：${file.name}`);
+      continue;
+    }
     const form = new FormData();
     form.append("file", file);
-    const res = await fetch("/playground-api/upload", { method: "POST", body: form });
+    let res = await fetch("/playground-api/upload", { method: "POST", body: form, headers: authHeaders() });
+    if (res.status === 401) {
+      if (!handleAuthFailure()) continue;
+      res = await fetch("/playground-api/upload", { method: "POST", body: form, headers: authHeaders() });
+    }
     if (!res.ok) continue;
     const data = await res.json();
     S.pendingAttachments.push(data);
@@ -425,17 +469,27 @@ async function sendMessage() {
   renderAll();
   setBusy(true);
 
-  const resp = await fetch("/playground-api/chat/stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session_id: S.currentSessionId,
-      provider,
-      model,
-      prompt: text,
-      attachment_ids: attachmentIds,
-    }),
+  const streamBody = JSON.stringify({
+    session_id: S.currentSessionId,
+    provider,
+    model,
+    prompt: text,
+    attachment_ids: attachmentIds,
   });
+  let resp = await fetch("/playground-api/chat/stream", {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: streamBody,
+  });
+  if (resp.status === 401) {
+    if (handleAuthFailure()) {
+      resp = await fetch("/playground-api/chat/stream", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: streamBody,
+      });
+    }
+  }
   if (!resp.ok || !resp.body) {
     setBusy(false);
     return;
@@ -585,4 +639,7 @@ bootstrap().then(() => {
   bindEvents();
   bindInputUX();
   setBusy(false);
+}).catch((err) => {
+  console.error("bootstrap failed:", err);
+  alert(`Playground 初始化失败：${(err && err.message) || err}`);
 });

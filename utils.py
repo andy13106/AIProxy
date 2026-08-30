@@ -1,16 +1,16 @@
-import streamlit as st
-from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import Session
 from db import SessionLocal, Provider, APIKey, ModelMapping, UsageLog, Base, ToolDefaultModel, SUPPORTED_PROVIDER_TYPES
 import datetime
 import requests
 import os
 import json
-import base64
 import socket
 
 
 def delete_item(model_class, item_id, success_msg):
+    # streamlit 懒加载：本模块同时被 FastAPI 后端引用，不能在顶层 import streamlit
+    import streamlit as st
+
     with SessionLocal() as session:
         try:
             if model_class == Provider:
@@ -118,6 +118,8 @@ def upsert_env_value(key: str, value: str, env_path: str = ".env") -> None:
 
 
 def copy_button(label: str, value: str, key: str):
+    import streamlit as st
+
     safe_value = json.dumps(value)
     safe_label = json.dumps(label)
     html = f"""

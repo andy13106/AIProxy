@@ -4,14 +4,16 @@ import datetime
 import json
 import mimetypes
 import os
+import secrets
 import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
+from config import settings
 from db import (
     APIKey,
     PlaygroundChatAttachment,
@@ -19,6 +21,7 @@ from db import (
     PlaygroundChatSession,
     Provider,
     SessionLocal,
+    utc_now,
 )
 from utils import classify_model_type, fetch_models, log_custom_usage
 
@@ -34,9 +37,25 @@ _MODEL_CACHE_TTL_SEC = 120
 _STREAM_STOP_FLAGS: dict[str, bool] = {}
 _NO_STORE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
 
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 单个附件最大 20MB
 
-def _now_utc() -> datetime.datetime:
-    return datetime.datetime.utcnow()
+
+def verify_playground_auth(request: Request) -> None:
+    """Playground API 鉴权：AUTH_ENABLED 时要求 MASTER_KEY。
+
+    接受 Authorization: Bearer <key> 或 X-Playground-Token 头。
+    未认证前禁止访问供应商/Key/会话等敏感数据。
+    """
+    if not settings.auth_enabled:
+        return
+    token = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+    if not token:
+        token = request.headers.get("x-playground-token")
+    if not token or not secrets.compare_digest(token, settings.master_key or ""):
+        raise HTTPException(status_code=401, detail="Unauthorized: playground API requires the master key")
 
 
 def _save_attachment(file_data: bytes, filename: str, mime_type: str) -> str:
@@ -104,7 +123,7 @@ def _provider_to_key() -> dict[str, tuple[Provider, APIKey]]:
 
 def _get_text_models(provider: Provider, key: APIKey) -> list[str]:
     cache_key = f"{provider.id}:{key.id}"
-    now = _now_utc()
+    now = utc_now()
     ts = _MODEL_CACHE_TS.get(cache_key)
     if ts and (now - ts).total_seconds() < _MODEL_CACHE_TTL_SEC and cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
@@ -125,7 +144,7 @@ def _format_title(messages: list[dict[str, Any]]) -> str:
 
 
 def _upsert_session(session_data: dict[str, Any]) -> None:
-    now = _now_utc()
+    now = utc_now()
     with SessionLocal() as session:
         db_obj = (
             session.query(PlaygroundChatSession)
@@ -304,7 +323,7 @@ def playground_ui_js() -> FileResponse:
 
 
 @router.get("/playground-api/bootstrap")
-def playground_bootstrap() -> dict[str, Any]:
+def playground_bootstrap(_auth: None = Depends(verify_playground_auth)) -> dict[str, Any]:
     provider_map = _provider_to_key()
     if not provider_map:
         return {"providers": [], "sessions": {}, "current_session_id": None}
@@ -325,7 +344,9 @@ def playground_bootstrap() -> dict[str, Any]:
 
 
 @router.post("/playground-api/session/new")
-def playground_new_session(payload: dict[str, Any]) -> dict[str, Any]:
+def playground_new_session(
+    payload: dict[str, Any], _auth: None = Depends(verify_playground_auth)
+) -> dict[str, Any]:
     provider = payload.get("provider")
     model = payload.get("model")
     sid = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
@@ -335,14 +356,22 @@ def playground_new_session(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.delete("/playground-api/session/{session_id}")
-def playground_drop_session(session_id: str) -> dict[str, bool]:
+def playground_drop_session(session_id: str, _auth: None = Depends(verify_playground_auth)) -> dict[str, bool]:
     _delete_session(session_id)
     return {"ok": True}
 
 
 @router.post("/playground-api/upload")
-async def playground_upload(file: UploadFile) -> dict[str, Any]:
+async def playground_upload(
+    file: UploadFile, _auth: None = Depends(verify_playground_auth)
+) -> dict[str, Any]:
+    # 先用声明的大小做快速拦截，避免大文件全量进内存
+    declared_size = getattr(file, "size", None)
+    if declared_size and declared_size > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"文件过大（上限 {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB）")
     raw = await file.read()
+    if len(raw) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"文件过大（上限 {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB）")
     mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
     att_id = _save_attachment(raw, file.filename or "upload.bin", mime_type)
     data = _get_attachment_data(att_id)
@@ -357,26 +386,23 @@ async def playground_upload(file: UploadFile) -> dict[str, Any]:
 
 
 @router.post("/playground-api/chat/stop/{stream_id}")
-def playground_stop_stream(stream_id: str) -> dict[str, bool]:
+def playground_stop_stream(stream_id: str, _auth: None = Depends(verify_playground_auth)) -> dict[str, bool]:
     _STREAM_STOP_FLAGS[stream_id] = True
     return {"ok": True}
 
 
-@router.post("/playground-api/chat/stream")
-async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
-    session_id = payload.get("session_id")
-    provider_name = payload.get("provider")
-    model_name = payload.get("model")
-    prompt = str(payload.get("prompt") or "")
-    attachment_ids = payload.get("attachment_ids") or []
-    if not session_id or not provider_name or not model_name:
-        raise HTTPException(status_code=400, detail="缺少必要参数")
+def _prepare_chat_state(
+    session_id: str,
+    provider_name: str,
+    model_name: str,
+    prompt: str,
+    attachment_ids: list,
+) -> tuple[Provider, APIKey, str, int, list[dict[str, Any]]]:
+    """同步 DB 操作打包成一个函数，供 asyncio.to_thread 调用，避免阻塞事件循环。"""
     provider_map = _provider_to_key()
     if provider_name not in provider_map:
         raise HTTPException(status_code=400, detail="供应商不可用")
     provider, key = provider_map[provider_name]
-    stream_id = f"stream_{uuid.uuid4().hex[:12]}"
-    _STREAM_STOP_FLAGS[stream_id] = False
 
     with SessionLocal() as session:
         messages = (
@@ -409,7 +435,7 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
         _upsert_session({"id": session_id, "title": title, "provider": provider_name, "model": model_name})
         user_idx = max_seq + 1
         assistant_idx = max_seq + 2
-        
+
         user_db_msg = (
             session.query(PlaygroundChatMessage)
             .filter(
@@ -438,9 +464,9 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
             # 更新消息内容和角色
             user_db_msg.role = "user"
             user_db_msg.content = prompt or ""
-        
+
         user_message_id = user_db_msg.id
-        
+
         if attachment_ids:
             session.query(PlaygroundChatAttachment).filter(
                 PlaygroundChatAttachment.message_id == user_message_id
@@ -457,7 +483,7 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
                 if db_attachment:
                     db_attachment.session_uid = session_id
                     db_attachment.message_id = user_message_id
-        
+
         assistant_db_msg = (
             session.query(PlaygroundChatMessage)
             .filter(
@@ -475,10 +501,62 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
             )
             session.add(assistant_db_msg)
             session.flush()
-        
+
         session.commit()
-        
+
     api_messages = _build_api_messages(history[:-1])
+    return provider, key, title, assistant_idx, api_messages
+
+
+def _finalize_chat(
+    session_id: str,
+    assistant_idx: int,
+    title: str,
+    provider_name: str,
+    model_name: str,
+    full_text: str,
+    usage_data: dict[str, Any],
+    key_id: int,
+) -> None:
+    _upsert_message(session_id, assistant_idx, "assistant", full_text)
+    _upsert_session({"id": session_id, "title": title, "provider": provider_name, "model": model_name})
+    prompt_tokens = int(usage_data.get("prompt_tokens") or 0)
+    completion_tokens = int(usage_data.get("completion_tokens") or 0)
+    total_tokens = int(usage_data.get("total_tokens") or (prompt_tokens + completion_tokens))
+    if total_tokens > 0:
+        log_custom_usage(
+            key_id=key_id,
+            model_name=model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
+
+@router.post("/playground-api/chat/stream")
+async def playground_chat_stream(
+    payload: dict[str, Any], _auth: None = Depends(verify_playground_auth)
+) -> StreamingResponse:
+    session_id = payload.get("session_id")
+    provider_name = payload.get("provider")
+    model_name = payload.get("model")
+    prompt = str(payload.get("prompt") or "")
+    attachment_ids = payload.get("attachment_ids") or []
+    if not session_id or not provider_name or not model_name:
+        raise HTTPException(status_code=400, detail="缺少必要参数")
+
+    stream_id = f"stream_{uuid.uuid4().hex[:12]}"
+    _STREAM_STOP_FLAGS[stream_id] = False
+
+    # 同步 DB 读写放入线程池执行，避免阻塞 FastAPI 事件循环
+    provider, key, title, assistant_idx, api_messages = await asyncio.to_thread(
+        _prepare_chat_state,
+        session_id,
+        provider_name,
+        model_name,
+        prompt,
+        attachment_ids,
+    )
 
     async def event_gen():
         usage_data: dict[str, Any] = {}
@@ -531,19 +609,17 @@ async def playground_chat_stream(payload: dict[str, Any]) -> StreamingResponse:
                     full_text = "[用户已停止生成]"
             if not full_text.strip():
                 full_text = "(空响应)"
-            _upsert_message(session_id, assistant_idx, "assistant", full_text)
-            _upsert_session({"id": session_id, "title": title, "provider": provider_name, "model": model_name})
-            prompt_tokens = int(usage_data.get("prompt_tokens") or 0)
-            completion_tokens = int(usage_data.get("completion_tokens") or 0)
-            total_tokens = int(usage_data.get("total_tokens") or (prompt_tokens + completion_tokens))
-            if total_tokens > 0:
-                log_custom_usage(
-                    key_id=key.id,
-                    model_name=model_name,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
-                )
+            await asyncio.to_thread(
+                _finalize_chat,
+                session_id,
+                assistant_idx,
+                title,
+                provider_name,
+                model_name,
+                full_text,
+                usage_data,
+                key.id,
+            )
             _STREAM_STOP_FLAGS.pop(stream_id, None)
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")

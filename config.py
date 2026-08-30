@@ -28,8 +28,10 @@ class Settings:
     allow_client_timeout_override: bool = field(
         default_factory=lambda: os.getenv("ALLOW_CLIENT_TIMEOUT_OVERRIDE", "false").lower() == "true"
     )
-    upstream_max_retries: int = field(default_factory=lambda: int(os.getenv("UPSTREAM_MAX_RETRIES", "0")))
     stream_heartbeat_sec: float = field(default_factory=lambda: float(os.getenv("STREAM_HEARTBEAT_SEC", "15")))
+    stream_max_duration_sec: float = field(
+        default_factory=lambda: float(os.getenv("STREAM_MAX_DURATION_SEC", "3600"))
+    )
     key_rate_limit_cooldown_sec: float = field(
         default_factory=lambda: float(os.getenv("KEY_RATE_LIMIT_COOLDOWN_SEC", "30"))
     )

@@ -1,6 +1,8 @@
 """AI Proxy Gateway - 主入口"""
 
 import json
+import os
+import secrets
 import time
 import uuid
 from collections import OrderedDict, defaultdict
@@ -44,6 +46,16 @@ from playground_web_api import router as playground_web_router
 async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
+    try:
+        proxy_workers = int(os.getenv("PROXY_WORKERS", "1") or "1")
+    except ValueError:
+        proxy_workers = 1
+    if proxy_workers > 1:
+        logger.warning(
+            f"PROXY_WORKERS={proxy_workers}: 内存速率限制、/v1/responses 存储 "
+            "与 playground 停止标志均为进程独立的，多 worker 下实际限流不精确、"
+            "previous_response_id 可能 404。生产环境建议保持单 worker 或引入 Redis。"
+        )
     yield
 
 
@@ -145,13 +157,24 @@ async def health_check():
     return {"status": "healthy", "service": "AI Proxy Gateway"}
 
 
+async def _parse_json_body(request: Request) -> dict:
+    """解析请求体 JSON，非法输入返回 400 而不是 500"""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return body
+
+
 async def verify_auth(credentials: HTTPAuthorizationCredentials = Security(security)):
     """验证认证"""
     if not settings.auth_enabled:
         return True
     if credentials is None:
         raise HTTPException(status_code=401, detail="Invalid API Key")
-    if credentials.credentials != settings.master_key:
+    if not secrets.compare_digest(credentials.credentials, settings.master_key):
         raise HTTPException(status_code=401, detail="Invalid API Key")
     return True
 
@@ -170,7 +193,7 @@ def _require_api_key_for_models(request: Request) -> None:
     if not settings.auth_enabled:
         return
     incoming_key = _extract_api_key_from_request(request)
-    if not incoming_key or incoming_key != settings.master_key:
+    if not incoming_key or not secrets.compare_digest(incoming_key, settings.master_key):
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
 
@@ -230,7 +253,7 @@ async def get_proxy_model(model_id: str, request: Request):
 @app.post("/chat/completions")
 async def chat_proxy(request: Request, auth=Depends(verify_auth)):
     """OpenAI 兼容的聊天接口"""
-    body = await request.json()
+    body = await _parse_json_body(request)
     logger.debug(f"/v1/chat/completions request - Model: {body.get('model')}, Stream: {body.get('stream', False)}")
     return await handle_completion(body, is_anthropic=False)
 
@@ -665,7 +688,7 @@ async def _ensure_mapped_response_model(body: dict[str, Any]) -> None:
 @app.post("/api/v1/responses")
 async def responses_proxy(request: Request, auth=Depends(verify_auth)):
     """OpenAI Responses 兼容接口，主要用于 Codex。"""
-    body = await request.json()
+    body = await _parse_json_body(request)
     logger.debug(f"/v1/responses request - Model: {body.get('model')}, Stream: {body.get('stream', False)}")
     body = dict(body)
     await _ensure_mapped_response_model(body)
@@ -949,13 +972,13 @@ async def anthropic_count_tokens(request: Request, x_api_key: Optional[str] = He
         api_key = auth_header.split(" ", 1)[1].strip()
 
     if settings.auth_enabled:
-        if not api_key or api_key != settings.master_key:
+        if not api_key or not secrets.compare_digest(api_key, settings.master_key):
             return JSONResponse(
                 status_code=401,
                 content={"error": {"type": "authentication_error", "message": "Invalid API Key"}},
             )
 
-    body = await request.json()
+    body = await _parse_json_body(request)
     messages = body.get("messages", [])
     system_text = body.get("system", "")
     if isinstance(system_text, list):
@@ -994,14 +1017,14 @@ async def anthropic_proxy(request: Request, x_api_key: Optional[str] = Header(No
     logger.debug(f"Auth attempt with key: {mask_secret(api_key)}")
 
     if settings.auth_enabled:
-        if not api_key or api_key != settings.master_key:
+        if not api_key or not secrets.compare_digest(api_key, settings.master_key):
             logger.warning(f"Auth failed. Expected: {mask_secret(settings.master_key)}, Got: {mask_secret(api_key)}")
             return JSONResponse(
                 status_code=401,
                 content={"error": {"type": "authentication_error", "message": "Invalid API Key"}},
             )
 
-    body = await request.json()
+    body = await _parse_json_body(request)
     logger.debug(f"/messages request - Model: {body.get('model')}, Stream: {body.get('stream', False)}")
     return await handle_completion(body, is_anthropic=True)
 
@@ -1029,16 +1052,14 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
     )
 
     async def cool_down_stream_failed_key(key_id: int, error: Exception) -> None:
-        error_text = str(error).lower()
         async with AsyncSessionLocal() as callback_session:
             if is_rate_limit_error(error):
                 retry_after = extract_retry_after_seconds(
                     error, default=int(settings.key_rate_limit_cooldown_sec)
                 )
                 await mark_key_rate_limited(callback_session, key_id, retry_after=retry_after)
-            elif is_transient_network_error(error_text):
-                await mark_key_rate_limited(callback_session, key_id, retry_after=15)
             else:
+                # 网络瞬断与其他未知错误统一短暂冷却，让 key 能较快恢复重试
                 await mark_key_rate_limited(callback_session, key_id, retry_after=15)
 
     async with AsyncSessionLocal() as session:
@@ -1097,7 +1118,7 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                         if response_size > 50 * 1024 * 1024:
                             logger.warning(f"Upstream response too large ({response_size} bytes), rejecting")
                             raise HTTPException(status_code=502, detail="Upstream response too large")
-                    except (TypeError, HTTPException):
+                    except HTTPException:
                         raise
                     except Exception:
                         pass  # 序列化失败不阻塞正常流程
@@ -1136,6 +1157,7 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                         log_usage_callback=log_usage,
                         stream_error_callback=cool_down_stream_failed_key,
                         heartbeat_sec=settings.stream_heartbeat_sec,
+                        max_stream_duration_sec=settings.stream_max_duration_sec,
                     )
                     return StreamingResponse(
                         generator.generate(),
@@ -1174,12 +1196,11 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
                 elif is_transient_network_error(error_text):
                     had_transient_network_error = True
                     try:
-                        # 网络瞬断冷却时间短一些，让 key 能较快恢复重试
+                        # 网络瞬断与其他未知错误统一短暂冷却，避免反复快速失败
                         await mark_key_rate_limited(session, api_key.id, retry_after=15)
                     except Exception as mark_err:
-                        logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
+                        logger.warning(f"Failed to cool down failed key {api_key.id}: {mark_err}")
                 else:
-                    # 其他未知错误也短暂冷却，避免反复快速失败
                     try:
                         await mark_key_rate_limited(session, api_key.id, retry_after=15)
                     except Exception as mark_err:
@@ -1213,7 +1234,7 @@ async def handle_completion(body: dict, is_anthropic: bool = False):
 @app.post("/images/generations")
 async def image_proxy(request: Request, auth=Depends(verify_auth)):
     """图片生成接口，根据 provider_type 自动路由"""
-    body = await request.json()
+    body = await _parse_json_body(request)
     model_name = body.get("model")
     if not model_name:
         raise HTTPException(status_code=400, detail="Missing required field: model")
@@ -1280,7 +1301,7 @@ async def ollama_tags_endpoint(request: Request):
 async def ollama_show_endpoint(request: Request):
     """兼容 Ollama 客户端的模型详情探测接口"""
     _require_api_key_for_models(request)
-    body = await request.json()
+    body = await _parse_json_body(request)
     model_name = body.get("name") or body.get("model")
     if not model_name:
         raise HTTPException(status_code=400, detail="Missing required field: name")

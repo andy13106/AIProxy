@@ -92,15 +92,20 @@ def start_services() -> None:
     admin_host = os.getenv("ADMIN_HOST", "0.0.0.0")
     admin_port = int(os.getenv("ADMIN_PORT", "8501"))
 
-    def _find_available_port(start_port: int, max_tries: int = 20) -> int | None:
+    def _find_available_port(start_port: int, max_tries: int = 20, host: str = "0.0.0.0") -> int | None:
+        # 用 bind 测试端口是否真正可用（connect 只能发现"已建立监听"的端口，
+        # 会漏掉 TIME_WAIT / SO_REUSEADDR 场景）
         for port in range(start_port, start_port + max_tries):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if sock.connect_ex(("127.0.0.1", port)) != 0:
-                    return port
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind((host, port))
+                return port
+            except OSError:
+                continue
         return None
 
-    selected_admin_port = _find_available_port(admin_port)
+    selected_admin_port = _find_available_port(admin_port, host=admin_host)
     frontend_process = None
     frontend_fail_count = 0
 
@@ -145,15 +150,18 @@ def start_services() -> None:
 
     print("\nServices started. Press Ctrl+C to stop.")
 
+    backend_started_at = time.time()
+    backend_fail_count = 0
+
     def stop_services():
         print("\nStopping services...")
-        
+
         if cleanup_threads:
             try:
                 cleanup_threads()
             except Exception:
                 pass
-        
+
         if frontend_process is not None and frontend_process.poll() is None:
             try:
                 if IS_WINDOWS:
@@ -177,7 +185,7 @@ def start_services() -> None:
                 except Exception:
                     pass
         
-        if backend_process.poll() is None:
+        if backend_process is not None and backend_process.poll() is None:
             backend_process.terminate()
             try:
                 backend_process.wait(timeout=10)
@@ -201,9 +209,25 @@ def start_services() -> None:
         while True:
             if _is_shutting_down():
                 break
-            if backend_process.poll() is not None:
-                print("Backend exited unexpectedly. Restarting...")
-                backend_process = subprocess.Popen(backend_cmd)
+            if backend_process is not None and backend_process.poll() is not None:
+                # 稳定运行超过 60s 后崩溃视为新故障，重置计数
+                if time.time() - backend_started_at > 60:
+                    backend_fail_count = 0
+                backend_fail_count += 1
+                if backend_fail_count >= 10:
+                    print(
+                        "Backend failed repeatedly (>=10 times). "
+                        "Stopping auto-restart. Check the logs and restart manually."
+                    )
+                    backend_process = None
+                else:
+                    delay = min(60, 2 * backend_fail_count)
+                    print(f"Backend exited unexpectedly. Restarting in {delay}s...")
+                    time.sleep(delay)
+                    if _is_shutting_down():
+                        break
+                    backend_process = subprocess.Popen(backend_cmd)
+                    backend_started_at = time.time()
             if frontend_process is not None and frontend_process.poll() is not None:
                 frontend_fail_count += 1
                 if frontend_fail_count >= 5:

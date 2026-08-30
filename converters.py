@@ -137,6 +137,7 @@ def convert_anthropic_messages_to_openai(messages: Optional[list]) -> list:
             continue
 
         text_parts = []
+        image_parts = []
         assistant_tool_calls = []
         tool_results = []
 
@@ -149,6 +150,22 @@ def convert_anthropic_messages_to_openai(messages: Optional[list]) -> list:
                 text = block.get("text")
                 if text:
                     text_parts.append(text)
+            elif block_type == "image" and role == "user":
+                # 保留图片块，转换为 OpenAI 的 image_url 内容格式
+                source = block.get("source") or {}
+                if isinstance(source, dict):
+                    if source.get("type") == "base64" and source.get("data"):
+                        media_type = source.get("media_type") or "image/png"
+                        image_parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{source['data']}"},
+                            }
+                        )
+                    elif source.get("type") == "url" and source.get("url"):
+                        image_parts.append(
+                            {"type": "image_url", "image_url": {"url": source["url"]}}
+                        )
             elif block_type == "tool_use" and role == "assistant":
                 tool_input = block.get("input", {})
                 tool_input = normalize_tool_input(block.get("name", "tool"), tool_input)
@@ -183,7 +200,13 @@ def convert_anthropic_messages_to_openai(messages: Optional[list]) -> list:
                 assistant_message["tool_calls"] = assistant_tool_calls
             converted.append(assistant_message)
         else:
-            if text_parts:
+            if image_parts:
+                content_parts = []
+                if text_parts:
+                    content_parts.append({"type": "text", "text": "".join(text_parts)})
+                content_parts.extend(image_parts)
+                converted.append({"role": role, "content": content_parts})
+            elif text_parts:
                 converted.append({"role": role, "content": "".join(text_parts)})
             elif not tool_results:
                 converted.append({"role": role, "content": ""})

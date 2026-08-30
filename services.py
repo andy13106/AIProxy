@@ -13,7 +13,6 @@ from fastapi import HTTPException
 from sqlalchemy import select, update
 
 from config import logger, settings
-from db import UsageLog
 from converters import (
     convert_anthropic_messages_to_openai,
     convert_anthropic_tool_choice,
@@ -22,7 +21,7 @@ from converters import (
     extract_text_from_content_blocks,
     extract_usage,
 )
-from db import APIKey, AsyncSessionLocal, ModelMapping, Provider
+from db import APIKey, AsyncSessionLocal, ModelMapping, Provider, UsageLog, utc_now
 
 _provider_key_cursor_lock = threading.Lock()
 _provider_key_cursor = defaultdict(int)
@@ -210,7 +209,7 @@ async def get_active_keys(session: Any, provider_id: int) -> list:
     if cooldown_sec <= 0:
         return _order_keys_for_provider(provider_id, keys)
 
-    now = datetime.datetime.utcnow()
+    now = utc_now()
     eligible_keys = []
     earliest_available_in = None
 
@@ -264,7 +263,7 @@ async def mark_key_rate_limited(session: Any, key_id: int, retry_after: Optional
 
     await session.execute(
         update(APIKey).where(APIKey.id == key_id).values(
-            last_failure=datetime.datetime.utcnow(),
+            last_failure=utc_now(),
             retry_after_seconds=cooldown_sec,
         )
     )
@@ -471,7 +470,6 @@ async def execute_image_generation(body: dict) -> dict:
                 return response
             except Exception as e:
                 logger.error(f"Key {api_key.id} failed for image generation: {e}")
-                error_text = str(e).lower()
                 if is_rate_limit_error(e):
                     try:
                         retry_after = extract_retry_after_seconds(
@@ -480,12 +478,8 @@ async def execute_image_generation(body: dict) -> dict:
                         await mark_key_rate_limited(session, api_key.id, retry_after=retry_after)
                     except Exception as mark_err:
                         logger.warning(f"Failed to mark key {api_key.id} as rate-limited: {mark_err}")
-                elif is_transient_network_error(error_text):
-                    try:
-                        await mark_key_rate_limited(session, api_key.id, retry_after=15)
-                    except Exception as mark_err:
-                        logger.warning(f"Failed to cool down transient-failed key {api_key.id}: {mark_err}")
                 else:
+                    # 网络瞬断与其他未知错误统一短暂冷却
                     try:
                         await mark_key_rate_limited(session, api_key.id, retry_after=15)
                     except Exception as mark_err:
@@ -585,7 +579,7 @@ async def execute_nvidia_image_generation(body: dict) -> dict:
 
                     # 转换为 OpenAI 兼容格式返回
                     return {
-                        "created": int(datetime.datetime.utcnow().timestamp()),
+                        "created": int(utc_now().timestamp()),
                         "data": [{"b64_json": b64}] if b64 else [],
                     }
 
